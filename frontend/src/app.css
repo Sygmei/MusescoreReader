@@ -305,10 +305,12 @@ h3 {
 .score-container.loaded {
   visibility: visible;
   /* height and overflow are controlled by score-viewer.ts inline styles.
-     The JS sets height = tallest system row and scrollTop to page-flip. */
+     NO padding here — padding offsets the scroll coordinate space and causes
+     the next system to bleed into view at the bottom.  Visual spacing is
+     provided by the outer margin on .score-container instead. */
   border: 1px solid var(--border);
   background: #fff;
-  padding: 8px;
+  overflow: hidden;
 }
 
 /* Do NOT set svg width/height here — OSMD renders the SVG at a specific pixel

@@ -56,13 +56,20 @@ export class ScoreViewer {
       drawComposer: false,
       drawCursors: true,
       followCursor: false,
+      zoom: 0.35,
     })
 
-    // zoom must be set as a property before render(), not as a constructor
-    // option — OSMD 1.9 ignores the constructor value in most code paths.
-    this.osmd.zoom = 0.35
-
     await this.osmd.load(xmlText)
+
+    // Set zoom after load() — some OSMD versions reset it during parsing.
+    // Set it in every possible way to be sure it takes effect before render().
+    this.osmd.zoom = 0.35
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (typeof (this.osmd as any).setOptions === 'function') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ;(this.osmd as any).setOptions({ zoom: 0.35 })
+    }
+    console.log('[ScoreViewer] zoom set to', this.osmd.zoom)
 
     // The CSS base rule has height:0; overflow:hidden on this container.
     // We must override BOTH before calling osmd.render() for two reasons:
@@ -227,12 +234,12 @@ export class ScoreViewer {
     if (i === this.currentSystemIdx) return
     this.currentSystemIdx = i
 
-    // Resize the container to this system's exact page height so no adjacent
-    // system bleeds into view.  +16 compensates for the 8px top+bottom padding
-    // that .score-container.loaded adds (box-sizing:border-box means padding
-    // is subtracted from the height, so we add it back).
+    // Resize the container to this system's exact page height.
+    // No padding offset needed — .score-container.loaded has no padding,
+    // so border-box height == visible viewport (minus 2px for 1px top+bottom
+    // border, which is imperceptible).
     const h = this.systemMap[i].heightPx
-    if (h > 0) this.container.style.height = `${h + 16}px`
+    if (h > 0) this.container.style.height = `${h}px`
 
     // Instant snap — no smooth-scroll so it feels like a page flip.
     this.container.scrollTop = this.systemMap[i].topPx
