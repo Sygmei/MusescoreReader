@@ -6,7 +6,7 @@ backend/.env
 *.db
 *.db-shm
 *.db-wal
-soundfonts/
+soundfonts/data/
 backend/data/
 **/.vscode/
 binaries/
