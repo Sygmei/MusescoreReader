@@ -1,0 +1,581 @@
+:root {
+  font-family:
+    'IBM Plex Sans',
+    'Segoe UI',
+    sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #f6ecd8;
+  background:
+    radial-gradient(circle at top left, rgba(237, 166, 87, 0.32), transparent 34%),
+    radial-gradient(circle at top right, rgba(143, 67, 43, 0.3), transparent 28%),
+    linear-gradient(180deg, #1a1412 0%, #0f0c0b 100%);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --panel: rgba(35, 24, 20, 0.8);
+  --panel-strong: rgba(56, 37, 30, 0.92);
+  --border: rgba(245, 222, 179, 0.12);
+  --border-strong: rgba(245, 222, 179, 0.25);
+  --accent: #efb366;
+  --accent-strong: #ffd39f;
+  --accent-deep: #b86138;
+  --text: #f6ecd8;
+  --text-dim: #cfbeaa;
+  --danger: #ff8d7a;
+  --success: #8fe3b0;
+  --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100vh;
+}
+
+body {
+  margin: 0;
+  /* Prevent any stray overflow (e.g. during OSMD's wide render pass) from
+     creating a page-level horizontal scrollbar. */
+  overflow-x: hidden;
+}
+
+a {
+  color: var(--accent-strong);
+}
+
+button,
+input,
+audio {
+  font: inherit;
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+}
+
+.page {
+  min-height: 100vh;
+  padding: 48px 0 72px;
+}
+
+.admin-shell,
+.public-shell {
+  width: 100%;
+  padding-inline: clamp(16px, 4vw, 64px);
+}
+
+.hero-panel {
+  margin-bottom: 32px;
+  padding: 36px;
+  border: 1px solid var(--border);
+  border-radius: 28px;
+  background:
+    linear-gradient(135deg, rgba(239, 179, 102, 0.12), transparent 55%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 100%),
+    var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.content-panel {
+  display: grid;
+  gap: 20px;
+}
+
+.eyebrow,
+.meta-label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-size: 0.78rem;
+  color: var(--accent);
+}
+
+.lede,
+.hint,
+.subtle {
+  color: var(--text-dim);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  margin-top: 10px;
+  font-size: clamp(2.4rem, 6vw, 4.8rem);
+  line-height: 0.95;
+  letter-spacing: -0.06em;
+}
+
+h2 {
+  font-size: clamp(1.4rem, 3vw, 2rem);
+}
+
+h3 {
+  font-size: 1.2rem;
+}
+
+.music-card {
+  padding: 24px;
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  /* Grid items default to min-width:auto, which lets them expand to content
+     size.  With a 30000px SVG inside, the card (and therefore the page)
+     would grow to 30000px.  min-width:0 allows the grid item to be
+     constrained to the column track width instead. */
+  min-width: 0;
+}
+
+.auth-card {
+  max-width: 720px;
+}
+
+.toolbar,
+.music-topline,
+.actions,
+.id-row,
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.actions {
+  flex-wrap: wrap;
+}
+
+.toolbar {
+  padding: 20px 24px;
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  background: rgba(22, 15, 13, 0.82);
+}
+
+.toolbar-title {
+  font-size: 1.05rem;
+}
+
+.upload-grid,
+.meta-grid,
+.music-list {
+  display: grid;
+  gap: 16px;
+}
+
+.upload-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 18px 0 20px;
+}
+
+.meta-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin: 16px 0;
+}
+
+.music-list {
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+}
+
+@media (min-width: 1400px) {
+  .music-list {
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  }
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+.field span {
+  color: var(--text-dim);
+  font-size: 0.92rem;
+}
+
+.field input {
+  width: 100%;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid var(--border-strong);
+  background: rgba(12, 10, 9, 0.65);
+  color: var(--text);
+}
+
+.file-field input {
+  padding-block: 11px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 13px 18px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+  color: #221611;
+  cursor: pointer;
+  text-decoration: none;
+  font-weight: 700;
+  transition:
+    transform 160ms ease,
+    border-color 160ms ease,
+    opacity 160ms ease;
+}
+
+.button:hover {
+  transform: translateY(-1px);
+}
+
+.button:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.button.secondary,
+.button.ghost {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+  border-color: var(--border-strong);
+}
+
+.status {
+  padding: 14px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.status.error {
+  color: var(--danger);
+  border-color: rgba(255, 141, 122, 0.25);
+}
+
+.status.success {
+  color: var(--success);
+  border-color: rgba(143, 227, 176, 0.25);
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: rgba(239, 179, 102, 0.14);
+  color: var(--accent-strong);
+  border: 1px solid rgba(239, 179, 102, 0.22);
+}
+
+.player {
+  width: 100%;
+  margin: 20px 0 18px;
+}
+
+.list-section {
+  display: grid;
+  gap: 18px;
+}
+
+/* Score viewer (OSMD) — paged mode */
+.score-container {
+  margin: 4px 0 12px;
+  border-radius: 16px;
+  min-width: 0;
+  width: 100%;
+  display: block;
+  overflow: hidden;
+  visibility: hidden;
+  height: 0;
+}
+
+.score-container.loaded {
+  visibility: visible;
+  /* height and overflow are controlled by score-viewer.ts inline styles.
+     The JS sets height = tallest system row and scrollTop to page-flip. */
+  border: 1px solid var(--border);
+  background: #fff;
+  padding: 8px;
+}
+
+/* Do NOT set svg width/height here — OSMD renders the SVG at a specific pixel
+   size matching the container width.  CSS scaling would distort the instrument
+   name margins, causing them to overlap note content. */
+
+.mixer-panel {
+  display: grid;
+  gap: 18px;
+  margin: 20px 0;
+}
+
+.transport-bar,
+.timeline-panel,
+.transport-buttons {
+  display: flex;
+  gap: 14px;
+}
+
+.transport-bar {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.transport-bar {
+  padding: 18px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+}
+
+.transport-buttons {
+  flex-wrap: wrap;
+}
+
+.timeline-panel {
+  flex: 1;
+  align-items: center;
+}
+
+.timeline-slider {
+  width: 100%;
+}
+
+.mixer-board {
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
+  overflow-x: auto;
+  padding: 4px 2px 12px;
+  align-items: stretch;
+}
+
+.channel-divider {
+  width: 1px;
+  background: var(--border-strong);
+  margin: 0 6px;
+  border-radius: 1px;
+  align-self: stretch;
+}
+
+.channel-strip {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10px 8px 8px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  min-width: 60px;
+  gap: 8px;
+  transition: opacity 160ms ease;
+}
+
+.channel-strip.global-strip {
+  background: rgba(239, 179, 102, 0.07);
+  border-color: rgba(239, 179, 102, 0.25);
+  margin-right: 4px;
+}
+
+.channel-strip.muted {
+  opacity: 0.45;
+}
+
+.channel-level {
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  line-height: 1;
+}
+
+.channel-fader {
+  height: 140px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.channel-gauge {
+  width: 8px;
+  height: 130px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.channel-gauge-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  border-radius: 4px;
+  background: linear-gradient(to top, #8fe3b0 0%, #efb366 72%, #ff7060 100%);
+  transition: height 60ms linear;
+  min-height: 0;
+}
+
+.channel-fader input[type='range'] {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  height: 130px;
+  width: 20px;
+  cursor: pointer;
+}
+
+.mute-btn {
+  width: 28px;
+  height: 22px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.mute-btn.active {
+  background: rgba(255, 100, 80, 0.25);
+  border-color: rgba(255, 100, 80, 0.5);
+  color: #ff7060;
+}
+
+.channel-name {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 0.7rem;
+  max-height: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  line-height: 1;
+}
+
+.fallback-player {
+  margin: 20px 0;
+}
+
+@media (max-width: 840px) {
+  .admin-shell,
+  .public-shell {
+    padding-inline: 14px;
+  }
+
+  .hero-panel,
+  .music-card,
+  .toolbar {
+    padding: 22px;
+    border-radius: 22px;
+  }
+
+  .toolbar,
+  .music-topline,
+  .actions,
+  .id-row,
+  .card-header,
+  .transport-bar,
+  .timeline-panel {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .upload-grid {
+    grid-template-columns: 1fr;
+  }
+
+  /* --- mixer: vertical list of horizontal strips --- */
+
+  .mixer-board {
+    flex-direction: column;
+    overflow-x: unset;
+  }
+
+  .channel-divider {
+    width: auto;
+    height: 1px;
+    margin: 4px 0;
+  }
+
+  .channel-strip {
+    flex-direction: row;
+    min-width: unset;
+    width: 100%;
+    padding: 8px 12px;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .channel-strip.global-strip {
+    margin-right: 0;
+    margin-bottom: 2px;
+  }
+
+  /* reorder: name → fader → level → mute */
+  .channel-name {
+    order: 0;
+    writing-mode: horizontal-tb;
+    transform: none;
+    max-height: unset;
+    min-width: 72px;
+    max-width: 72px;
+    font-size: 0.75rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .channel-fader {
+    order: 1;
+    flex: 1;
+    height: auto;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: center;
+    gap: 0;
+  }
+
+  /* gauge is height-driven by JS — hide on mobile, slider is enough */
+  .channel-gauge {
+    display: none;
+  }
+
+  .channel-fader input[type='range'] {
+    writing-mode: horizontal-tb;
+    direction: ltr;
+    width: 100%;
+    height: auto;
+  }
+
+  .channel-level {
+    order: 2;
+    min-width: 34px;
+    text-align: right;
+  }
+
+  .mute-btn {
+    order: 3;
+    flex-shrink: 0;
+  }
+}
