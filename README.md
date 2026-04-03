@@ -93,3 +93,51 @@ npm.cmd run build
 ```
 
 Then run the backend. If `frontend/dist` exists, the Rust server also serves the compiled SPA.
+
+## Docker images
+
+This repository now includes three Docker build targets:
+
+- `Dockerfile.frontend` builds the Svelte app into a small static image served by Nginx
+- `Dockerfile.backend` builds the Rust API server into a runtime image
+- `Dockerfile.soundfonts` builds a read-only asset image for the soundfont bundle
+
+Build the frontend image from the repository root:
+
+```bash
+docker build -f Dockerfile.frontend -t musescore-reader-frontend .
+```
+
+Build the backend image from the repository root:
+
+```bash
+docker build -f Dockerfile.backend -t musescore-reader-backend .
+```
+
+Build the soundfonts image from the repository root. The image reads `soundfonts/sources.json`,
+downloads each archive, and installs it under the matching key name:
+
+```bash
+docker build -f Dockerfile.soundfonts -t musescore-reader-soundfonts .
+```
+
+The backend image defaults to:
+
+```bash
+BIND_ADDRESS=0.0.0.0:3000
+DATABASE_PATH=/data/musescore-reader.db
+LOCAL_STORAGE_PATH=/data/storage
+SOUNDFONT_DIR=/opt/soundfonts
+```
+
+For Kubernetes, the intended setup is:
+
+- run `musescore-reader-frontend` as the public web app
+- run `musescore-reader-backend` as the API service
+- mount the contents of `musescore-reader-soundfonts` into the backend pod at `/opt/soundfonts`
+
+The frontend image serves only static files. Route `/api` to the backend with Ingress or another
+cluster-level proxy.
+
+`Dockerfile.backend` includes `ffmpeg` and `fluidsynth`. If you want MIDI export and stem rendering
+fully inside that image, you should extend it to also provide `MUSESCORE_BIN` and `SFIZZ_BIN`.

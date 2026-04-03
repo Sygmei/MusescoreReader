@@ -1,0 +1,46 @@
+FROM rust:1-bookworm AS build
+
+WORKDIR /app/backend
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libsqlite3-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/src ./src
+
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        ffmpeg \
+        fluidsynth \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system app \
+    && useradd --system --gid app --create-home --home-dir /home/app app \
+    && mkdir -p /data/storage /opt/soundfonts \
+    && chown -R app:app /data /home/app /opt/soundfonts
+
+WORKDIR /app
+
+COPY --from=build /app/backend/target/release/backend /usr/local/bin/musescore-reader
+
+ENV BIND_ADDRESS=0.0.0.0:3000 \
+    DATABASE_PATH=/data/musescore-reader.db \
+    LOCAL_STORAGE_PATH=/data/storage \
+    SOUNDFONT_DIR=/opt/soundfonts
+
+USER app
+
+EXPOSE 3000
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/musescore-reader"]

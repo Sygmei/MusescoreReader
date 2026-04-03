@@ -1,0 +1,45 @@
+FROM alpine:3.22 AS build
+
+RUN apk add --no-cache \
+    bash \
+    coreutils \
+    curl \
+    jq \
+    unzip
+
+WORKDIR /workspace
+
+COPY soundfonts/ ./soundfonts/
+
+RUN test -f /workspace/soundfonts/mapping.json \
+    && test -f /workspace/soundfonts/sources.json
+
+RUN set -euo pipefail; \
+    mkdir -p /opt/soundfonts; \
+    cp /workspace/soundfonts/mapping.json /opt/soundfonts/mapping.json; \
+    if [ -f /workspace/soundfonts/gains.json ]; then \
+        cp /workspace/soundfonts/gains.json /opt/soundfonts/gains.json; \
+    fi; \
+    jq -r 'to_entries[] | @base64' /workspace/soundfonts/sources.json | while IFS= read -r entry; do \
+        name="$(printf '%s' "$entry" | base64 -d | jq -r '.key')"; \
+        url="$(printf '%s' "$entry" | base64 -d | jq -r '.value')"; \
+        archive="/tmp/archive.zip"; \
+        extract_dir="/tmp/extract"; \
+        install_dir="/opt/soundfonts/$name"; \
+        rm -rf "$archive" "$extract_dir" "$install_dir"; \
+        mkdir -p "$extract_dir" "$install_dir"; \
+        curl -L --fail --retry 3 --output "$archive" "$url"; \
+        unzip -q "$archive" -d "$extract_dir"; \
+        top_level_count="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"; \
+        if [ "$top_level_count" = "1" ] && [ -z "$(find "$extract_dir" -mindepth 1 -maxdepth 1 ! -type d -print -quit)" ]; then \
+            source_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"; \
+            cp -a "$source_dir"/. "$install_dir"/; \
+        else \
+            cp -a "$extract_dir"/. "$install_dir"/; \
+        fi; \
+        rm -rf "$archive" "$extract_dir"; \
+    done
+
+FROM scratch
+
+COPY --from=build /opt/soundfonts /opt/soundfonts
