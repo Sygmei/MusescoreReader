@@ -61,8 +61,20 @@ export class ScoreViewer {
 
     await this.osmd.load(xmlText)
 
-    // Set zoom after load() — some OSMD versions reset it during parsing.
-    // Set it in every possible way to be sure it takes effect before render().
+    // Ensure abbreviation labels = full names both in the XML (already done
+    // in stripUnsupportedElements) AND at the OSMD model level.
+    //
+    // OSMD caches abbreviation text from the XML during load() and uses those
+    // cached strings to compute the label-column width before render() runs.
+    // Overriding the private abbreviationStr field here forces the render to
+    // use the full name width for the label column on every system.
+    const parts: unknown[] = (this.osmd as any).Sheet?.Parts ?? []
+    for (const part of parts) {
+      try {
+        const fullName: string = (part as any).nameStr ?? (part as any).Name ?? ''
+        if (fullName) (part as any).abbreviationStr = fullName
+      } catch { /* ignore */ }
+    }
     this.osmd.zoom = 0.35
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (typeof (this.osmd as any).setOptions === 'function') {
@@ -70,6 +82,17 @@ export class ScoreViewer {
       ;(this.osmd as any).setOptions({ zoom: 0.35 })
     }
     console.log('[ScoreViewer] zoom set to', this.osmd.zoom)
+
+    // Ensure part names AND abbreviations are both rendered.
+    // We rewrote the abbreviations in the XML to equal the full names, so all
+    // systems will show the same label text.  Set EngravingRules explicitly so
+    // OSMD doesn't fall back to its defaults and suppress either.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rules = (this.osmd as any).EngravingRules
+    if (rules) {
+      rules.RenderPartNames = true
+      rules.RenderPartAbbreviations = true
+    }
 
     // The CSS base rule has height:0; overflow:hidden on this container.
     // We must override BOTH before calling osmd.render() for two reasons:
@@ -369,6 +392,35 @@ function stripUnsupportedElements(xmlText: string): string {
   result = result.replace(/<display-step><\/display-step>/g, '<display-step>B</display-step>')
   // Also clamp the absurd octave values MuseScore 4 writes for these same notes.
   result = result.replace(/<display-octave>(\d{3,})<\/display-octave>/g, '<display-octave>4</display-octave>')
+
+  // Replace each <part-abbreviation> with the corresponding <part-name> so
+  // OSMD renders the same full instrument name on every system row, not just
+  // the first.  OSMD uses the abbreviation text for systems 2+; by making
+  // abbreviations equal to full names, all pages look identical.
+  // Also INSERT a <part-abbreviation> for parts that don't have one at all,
+  // otherwise OSMD stores an empty string and computes a zero-width label
+  // column for those parts on systems 2+.
+  result = result.replace(
+    /<score-part[^>]*>[\s\S]*?<\/score-part>/g,
+    (scorePart) => {
+      const nameMatch = scorePart.match(/<part-name[^>]*>([\s\S]*?)<\/part-name>/)
+      if (!nameMatch) return scorePart
+      const fullName = nameMatch[1]
+      if (/<part-abbreviation/.test(scorePart)) {
+        // Replace existing abbreviation with full name.
+        return scorePart.replace(
+          /<part-abbreviation[^>]*>[\s\S]*?<\/part-abbreviation>/g,
+          `<part-abbreviation>${fullName}</part-abbreviation>`
+        )
+      } else {
+        // No abbreviation element at all — insert one after </part-name>.
+        return scorePart.replace(
+          /(<\/part-name>)/,
+          `$1<part-abbreviation>${fullName}</part-abbreviation>`
+        )
+      }
+    }
+  )
 
   const forPartCount = (xmlText.match(/<for-part[^>]*>/g) ?? []).length
   const transposeCount = (xmlText.match(/<transpose[^>]*>/g) ?? []).length
