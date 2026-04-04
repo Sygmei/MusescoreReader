@@ -21,7 +21,8 @@ COPY backend/src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/app/backend/target \
-    cargo build --release --locked
+    cargo build --release --locked \
+    && cp /app/backend/target/release/fumen-backend /tmp/fumen-backend
 
 FROM debian:bookworm AS sfizz-build
 
@@ -111,7 +112,7 @@ RUN groupadd --system --gid "${APP_GID}" app \
 
 WORKDIR /app
 
-COPY --from=build /app/backend/target/release/fumen-backend /usr/local/bin/fumen
+COPY --from=build /tmp/fumen-backend /usr/local/bin/fumen
 COPY --from=sfizz-build /opt/sfizz/bin/sfizz_render /usr/local/bin/sfizz_render
 COPY --from=musescore-build /opt/musescore4 /opt/musescore4
 
