@@ -7,7 +7,6 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
-pub const STEM_CHUNK_DURATION_SECONDS: u32 = 4;
 pub const DEFAULT_STEM_QUALITY_PROFILE: &str = "standard";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +130,7 @@ pub struct StemResult {
 }
 
 struct TrackInfo {
-    /// Index into the raw MIDI track chunks list (chunk 0 is the tempo track).
+    /// Index into the original MIDI track list / raw MTrk chunk list.
     midi_track_index: usize,
     track_name: String,
     program: u8,
@@ -290,10 +289,10 @@ pub async fn generate_stems(
         ));
     }
 
-    // Build a clean tempo track (meta events only) from chunk 0 so that note
-    // events in MuseScore's combined conductor+instrument track don't bleed
-    // into every other stem.
-    let clean_tempo_chunk = strip_channel_events(chunks[0]);
+    // Build one clean tempo track from all MIDI tracks. Some MuseScore exports
+    // place the real tempo map outside raw track 0, so assuming chunk 0 owns
+    // tempo can make rendered stems fall back to the wrong BPM.
+    let clean_tempo_chunk = build_global_tempo_chunk(&midi_bytes);
 
     let total = track_infos.len();
     tracing::info!("stems: found {total} instrument tracks, starting render");
@@ -926,83 +925,6 @@ pub async fn generate_stems(
         tracing::info!("stems: render complete – {}/{total} stems produced", stems.len());
         Ok((stems, "ready".to_owned(), None))
     }
-}
-
-/// Mix all `stem_*.wav` files in `output_dir` into a single MP3 preview using
-/// ffmpeg. Called after `generate_stems` so the WAVs are already on disk.
-/// Returns `ConversionOutcome::Unavailable` when no WAV files exist (e.g.
-/// sfizz is not configured).
-pub async fn mix_stems_to_preview(output_dir: &Path) -> Result<ConversionOutcome> {
-    let ffmpeg = match find_ffmpeg_binary().await {
-        Some(bin) => bin,
-        None => {
-            return Ok(ConversionOutcome::Unavailable {
-                reason: "ffmpeg not found; cannot mix stems into preview.".to_owned(),
-            });
-        }
-    };
-
-    // Collect all stem WAV files produced by generate_stems.
-    let mut wav_paths: Vec<PathBuf> = Vec::new();
-    let mut read_dir = tokio::fs::read_dir(output_dir)
-        .await
-        .context("reading output dir for stem WAVs")?;
-    while let Some(entry) = read_dir.next_entry().await? {
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "wav")
-            && path
-                .file_name()
-                .map_or(false, |n| n.to_string_lossy().starts_with("stem_"))
-        {
-            wav_paths.push(path);
-        }
-    }
-
-    if wav_paths.is_empty() {
-        return Ok(ConversionOutcome::Unavailable {
-            reason: "No stem WAV files found; stems may not have rendered.".to_owned(),
-        });
-    }
-
-    wav_paths.sort();
-    let n = wav_paths.len();
-    let preview_path = output_dir.join("preview.mp3");
-
-    let mut cmd = Command::new(&ffmpeg);
-    cmd.arg("-y");
-    for path in &wav_paths {
-        cmd.arg("-i").arg(path);
-    }
-    if n > 1 {
-        cmd.arg("-filter_complex")
-            .arg(format!("amix=inputs={n}:duration=longest:normalize=0"));
-    }
-    cmd.arg("-c:a")
-        .arg("libmp3lame")
-        .arg("-b:a")
-        .arg("192k")
-        .arg(&preview_path);
-
-    let out = cmd.output().await.context("ffmpeg mix spawn error")?;
-    if !out.status.success() {
-        return Ok(ConversionOutcome::Failed {
-            reason: format!(
-                "ffmpeg stem mix failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-        });
-    }
-
-    let bytes = tokio::fs::read(&preview_path)
-        .await
-        .context("reading preview MP3")?;
-
-    tracing::info!("stems: mixed {n} WAV(s) into preview MP3 ({} KB)", bytes.len() / 1024);
-    Ok(ConversionOutcome::Ready {
-        bytes: Bytes::from(bytes),
-        content_type: "audio/mpeg",
-        extension: "mp3",
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,10 +1668,7 @@ fn split_midi_track_3way(
         return (Vec::new(), Vec::new(), Vec::new());
     };
 
-    let tempo_map = match smf.tracks.first() {
-        Some(t) => build_tempo_map(t),
-        None => vec![(0u32, 500_000u32)],
-    };
+    let tempo_map = build_global_tempo_map(&smf);
 
     // --- Pass 1: compute absolute ticks and classify each NoteOn ------------
 
@@ -1848,25 +1767,68 @@ fn split_midi_track_3way(
     (build_mtrk(stac_events), build_mtrk(sus_events), build_mtrk(vib_events))
 }
 
-/// Collect tempo change events from a MIDI track into a sorted
-/// `Vec<(abs_tick, µs_per_quarter_note)>`.  Defaults to 120 BPM (500 000 µs).
-fn build_tempo_map(track: &[midly::TrackEvent<'_>]) -> Vec<(u32, u32)> {
+/// Collect tempo change events from all MIDI tracks into one sorted
+/// `Vec<(abs_tick, µs_per_quarter_note)>`. Defaults to 120 BPM when no tempo
+/// event exists at tick 0.
+fn build_global_tempo_map(smf: &Smf<'_>) -> Vec<(u32, u32)> {
     let mut map: Vec<(u32, u32)> = vec![(0, 500_000)];
-    let mut abs = 0u32;
-    for ev in track {
-        abs = abs.saturating_add(u32::from(ev.delta));
-        if let TrackEventKind::Meta(MetaMessage::Tempo(t)) = &ev.kind {
-            let us = u32::from(*t);
-            if let Some(last) = map.last_mut() {
-                if last.0 == abs {
-                    last.1 = us;
-                    continue;
-                }
+    let mut tempo_events: Vec<(u32, u32)> = Vec::new();
+
+    for track in &smf.tracks {
+        let mut abs = 0u32;
+        for ev in track {
+            abs = abs.saturating_add(u32::from(ev.delta));
+            if let TrackEventKind::Meta(MetaMessage::Tempo(t)) = &ev.kind {
+                tempo_events.push((abs, u32::from(*t)));
             }
-            map.push((abs, us));
         }
     }
+
+    tempo_events.sort_by_key(|(tick, _)| *tick);
+    for (tick, us) in tempo_events {
+        if let Some(last) = map.last_mut() {
+            if last.0 == tick {
+                last.1 = us;
+                continue;
+            }
+            if last.1 == us {
+                continue;
+            }
+        }
+        map.push((tick, us));
+    }
+
     map
+}
+
+/// Build a clean MTrk chunk that carries the global tempo map for the score.
+/// Tempo events are collected from all tracks because some MuseScore exports do
+/// not store them in raw track 0.
+fn build_global_tempo_chunk(midi_bytes: &[u8]) -> Vec<u8> {
+    let smf = match Smf::parse(midi_bytes) {
+        Ok(smf) => smf,
+        Err(error) => {
+            tracing::warn!("stems: could not parse MIDI tempo map, falling back to track 0 meta events: {error}");
+            return extract_raw_midi_chunks(midi_bytes)
+                .first()
+                .map(|chunk| strip_channel_events(chunk))
+                .unwrap_or_else(|| build_mtrk(Vec::new()));
+        }
+    };
+
+    let events = build_global_tempo_map(&smf)
+        .into_iter()
+        .filter_map(|(tick, us_per_qn)| {
+            if tick == 0 && us_per_qn == 500_000 {
+                return None;
+            }
+
+            let bytes = us_per_qn.to_be_bytes();
+            Some((tick, vec![0xFF, 0x51, 0x03, bytes[1], bytes[2], bytes[3]]))
+        })
+        .collect();
+
+    build_mtrk(events)
 }
 
 /// Convert a tick-based note duration to wall-clock microseconds, correctly

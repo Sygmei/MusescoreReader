@@ -55,9 +55,7 @@ pub struct StemInfo {
     pub track_index: i64,
     pub track_name: String,
     pub instrument_name: String,
-    pub chunk_url_template: String,
-    pub chunk_count: i64,
-    pub chunk_duration_seconds: f64,
+    pub full_stem_url: String,
     pub duration_seconds: f64,
 }
 

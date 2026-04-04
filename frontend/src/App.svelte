@@ -234,6 +234,11 @@
       }
 
       await scoreTask
+
+      mixerRequested = true
+      if (music.stems_status === 'ready' && publicAccessKey) {
+        await loadStemMixer(publicAccessKey)
+      }
     } catch (error) {
       publicError = error instanceof Error ? error.message : 'Unable to load this score'
     } finally {
@@ -277,10 +282,7 @@
     try {
       const stems = await fetchStems(accessKey)
       if (stems.length === 0) {
-        // No stems available – fall back to MIDI if present
-        if (publicMusic?.midi_download_url) {
-          await loadMidiMixer(publicMusic.midi_download_url)
-        }
+        midiPlayerError = 'No stems available for this score'
         return
       }
 
@@ -290,9 +292,7 @@
           id: String(s.track_index),
           name: s.track_name,
           instrumentName: s.instrument_name,
-          chunkUrlTemplate: s.chunk_url_template,
-          chunkCount: s.chunk_count,
-          chunkDurationSeconds: s.chunk_duration_seconds,
+          fullStemUrl: s.full_stem_url,
           durationSeconds: s.duration_seconds,
         })),
       )
@@ -303,49 +303,9 @@
       playbackState = 'stopped'
       playerMode = 'stems'
     } catch (error) {
-      midiPlayerError =
-        error instanceof Error ? error.message : 'Unable to prepare stem playback'
-      // Fall back to MIDI
-      if (publicMusic?.midi_download_url) {
-        await loadMidiMixer(publicMusic.midi_download_url)
-      }
+      midiPlayerError = error instanceof Error ? error.message : 'Unable to prepare stem playback'
     } finally {
       midiLoading = false
-    }
-  }
-
-  async function loadMidiMixer(url: string) {
-    midiLoading = true
-    midiPlayerError = ''
-
-    try {
-      midiPlayer = new MidiMixerPlayer()
-      const loaded = await midiPlayer.loadFromUrl(url)
-      mixerTracks = loaded.tracks
-      playbackDuration = loaded.duration
-      playbackPosition = 0
-      playbackState = 'stopped'
-      playerMode = 'midi'
-    } catch (error) {
-      midiPlayerError = error instanceof Error ? error.message : 'Unable to prepare MIDI playback'
-    } finally {
-      midiLoading = false
-    }
-  }
-
-  async function openMixer() {
-    if (!publicMusic || midiLoading || mixerTracks.length > 0) {
-      mixerRequested = true
-      return
-    }
-
-    mixerRequested = true
-    if (publicMusic.stems_status === 'ready' && publicAccessKey) {
-      await loadStemMixer(publicAccessKey)
-      return
-    }
-    if (publicMusic.midi_download_url) {
-      await loadMidiMixer(publicMusic.midi_download_url)
     }
   }
 
@@ -586,34 +546,6 @@
             <p class="status error">Score: {scoreError}</p>
           {/if}
 
-          {#if publicMusic.audio_stream_url}
-            <div class="fallback-player">
-              <p class="hint">
-                Use the preview for instant playback. Open the mixer only when you want
-                per-instrument control.
-              </p>
-              <audio class="player" controls preload="metadata" src={publicMusic.audio_stream_url}>
-                Your browser does not support audio playback.
-              </audio>
-            </div>
-          {/if}
-
-          {#if publicMusic.stems_status === 'ready' || publicMusic.midi_download_url}
-            <div class="actions">
-              <button class="button" on:click={openMixer}>
-                {mixerTracks.length > 0
-                  ? 'Mixer Ready'
-                  : midiLoading
-                    ? 'Preparing Mixer...'
-                    : publicMusic.stems_status === 'ready'
-                      ? 'Open Stem Mixer'
-                      : playerMode === 'midi'
-                      ? 'Open MIDI Mixer'
-                      : 'Open MIDI Mixer'}
-              </button>
-            </div>
-          {/if}
-
           {#if midiLoading}
             <p class="status">Preparing playback...</p>
           {:else if mixerTracks.length > 0}
@@ -685,19 +617,15 @@
             </div>
           {:else if mixerRequested}
             <p class="hint">
-              Mixer playback is not available yet.
+              Stem playback is not available yet.
               {#if publicMusic.stems_error}
                 <br />
                 <span>Stems: {publicMusic.stems_error}</span>
               {/if}
-              {#if publicMusic.midi_error}
-                <br />
-                <span>MIDI: {publicMusic.midi_error}</span>
-              {/if}
             </p>
           {:else}
             <p class="hint">
-              Open the mixer when you want per-instrument volume control.
+              Preparing stem playback.
             </p>
           {/if}
 
@@ -705,15 +633,8 @@
             <p class="status error">{midiPlayerError}</p>
           {/if}
 
-          {#if publicMusic.audio_error && !mixerTracks.length}
-            <p class="hint">{publicMusic.audio_error}</p>
-          {/if}
-
           <div class="actions">
             <a class="button secondary" href={publicMusic.download_url}>Download .mscz</a>
-            {#if publicMusic.audio_stream_url}
-              <a class="button secondary" href={publicMusic.audio_stream_url} download="preview.mp3">Download audio</a>
-            {/if}
             {#if publicMusic.midi_download_url}
               <a class="button secondary" href={publicMusic.midi_download_url}>Download MIDI</a>
             {/if}

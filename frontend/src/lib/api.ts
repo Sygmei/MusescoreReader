@@ -65,9 +65,7 @@ export type Stem = {
   track_index: number
   track_name: string
   instrument_name: string
-  chunk_url_template: string
-  chunk_count: number
-  chunk_duration_seconds: number
+  full_stem_url: string
   duration_seconds: number
 }
 

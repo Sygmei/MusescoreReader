@@ -98,6 +98,13 @@ impl Storage {
             )),
         }
     }
+
+    pub fn local_path_for_key(&self, key: &str) -> Option<PathBuf> {
+        match &self.backend {
+            StorageBackend::Local { root } => Some(path_for_key(root, key)),
+            StorageBackend::S3 { .. } => None,
+        }
+    }
 }
 
 fn build_s3_client(config: &S3Config) -> Client {
