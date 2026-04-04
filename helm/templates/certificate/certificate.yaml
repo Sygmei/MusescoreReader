@@ -2,6 +2,7 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: {{ include "fumen.certificateName" . }}
+{{- $coveredDomains := dict }}
 spec:
   secretName: {{ include "fumen.certificateSecretName" . }}
   privateKey:
@@ -10,7 +11,9 @@ spec:
     name: {{ include "fumen.issuerName" . }}
     kind: Issuer
   dnsNames:
-    - "*.{{ include "fumen.baseDomain" . }}"
-    - "{{ include "fumen.baseDomain" . }}"
-    - "{{ .Values.frontend.ingress.domain }}"
-    - "{{ .Values.backend.ingress.domain }}"
+{{- range $domain := list .Values.frontend.ingress.domain .Values.backend.ingress.domain }}
+  {{- if and $domain (not (hasKey $coveredDomains $domain)) }}
+    - "{{ $domain }}"
+    {{- $_ := set $coveredDomains $domain true }}
+  {{- end }}
+{{- end }}

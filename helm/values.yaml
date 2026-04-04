@@ -4,7 +4,8 @@ backend:
   ingress:
     domain: "fumen-api.lehang.art"
   soundfonts:
-    version: "1.0.0"
+    image: "ghcr.io/sygmei/fumen-soundfonts"
+    version: "1.1.0"
 
 frontend:
   version: "0.1.0"

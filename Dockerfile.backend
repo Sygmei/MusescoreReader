@@ -62,6 +62,9 @@ RUN curl -fsSL "$MUSESCORE_APPIMAGE_URL" -o MuseScore.AppImage \
 
 FROM debian:bookworm-slim
 
+ARG APP_UID=10001
+ARG APP_GID=10001
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
@@ -88,8 +91,8 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN groupadd --system app \
-    && useradd --system --gid app --create-home --home-dir /home/app app \
+RUN groupadd --system --gid "${APP_GID}" app \
+    && useradd --system --uid "${APP_UID}" --gid app --create-home --home-dir /home/app app \
     && mkdir -p /data/storage /opt/soundfonts \
     && chown -R app:app /data /home/app /opt/soundfonts
 
@@ -111,7 +114,7 @@ ENV BIND_ADDRESS=0.0.0.0:3000 \
     MUSESCORE_BIN=/usr/local/bin/musescore4 \
     QT_QPA_PLATFORM=offscreen
 
-USER app
+USER ${APP_UID}:${APP_GID}
 
 EXPOSE 3000
 
