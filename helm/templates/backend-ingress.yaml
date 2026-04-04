@@ -1,20 +1,27 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "musescore-reader.backend.fullname" . }}
+  name: {{ include "fumen.backend.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+    app.kubernetes.io/name: {{ include "fumen.name" . }}
     app.kubernetes.io/component: backend
     app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: "{{ .Release.Namespace }}-https-redirect-mw@kubernetescrd"
 spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - "{{ .Values.backend.ingress.domain }}"
+      secretName: {{ include "fumen.certificateSecretName" . }}
   rules:
-    - host: {{ .Values.backend.ingress.domain }}
+    - host: "{{ .Values.backend.ingress.domain }}"
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: {{ include "musescore-reader.backend.fullname" . }}
+                name: {{ include "fumen.backend.fullname" . }}
                 port:
                   name: http

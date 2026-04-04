@@ -1,29 +1,46 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "musescore-reader.frontend.fullname" . }}
+  name: {{ include "fumen.frontend.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+    app.kubernetes.io/name: {{ include "fumen.name" . }}
     app.kubernetes.io/component: frontend
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+      app.kubernetes.io/name: {{ include "fumen.name" . }}
       app.kubernetes.io/component: frontend
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+        app.kubernetes.io/name: {{ include "fumen.name" . }}
         app.kubernetes.io/component: frontend
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: frontend
-          image: ghcr.io/sygmei/musescore-reader-frontend:{{ .Values.frontend.version }}
+          image: ghcr.io/sygmei/fumen-frontend:{{ .Values.frontend.version }}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
           ports:
             - name: http
               containerPort: 8080

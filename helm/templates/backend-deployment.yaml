@@ -1,29 +1,46 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "musescore-reader.backend.fullname" . }}
+  name: {{ include "fumen.backend.fullname" . }}
   labels:
-    app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+    app.kubernetes.io/name: {{ include "fumen.name" . }}
     app.kubernetes.io/component: backend
     app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.backend.replicas }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+      app.kubernetes.io/name: {{ include "fumen.name" . }}
       app.kubernetes.io/component: backend
       app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ include "musescore-reader.name" . }}
+        app.kubernetes.io/name: {{ include "fumen.name" . }}
         app.kubernetes.io/component: backend
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
         - name: soundfonts
-          image: ghcr.io/sygmei/musescore-reader-soundfonts:{{ .Values.backend.soundfonts.version }}
+          image: ghcr.io/sygmei/fumen-soundfonts:{{ .Values.backend.soundfonts.version }}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
           command:
             - /bin/sh
             - -c
@@ -33,8 +50,21 @@ spec:
               mountPath: /mnt/soundfonts
       containers:
         - name: backend
-          image: ghcr.io/sygmei/musescore-reader-backend:{{ .Values.backend.version }}
+          image: ghcr.io/sygmei/fumen-backend:{{ .Values.backend.version }}
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsNonRoot: true
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
           env:
             - name: BIND_ADDRESS
               value: 0.0.0.0:3000
@@ -55,6 +85,31 @@ spec:
                 secretKeyRef:
                   name: postgresql-credentials
                   key: connection-string-ro
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: bucket-name
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: access-key-id
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: secret-key
+            - name: S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: region-name
+            - name: S3_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: s3-creds
+                  key: endpoint-url
             - name: SOUNDFONT_DIR
               value: /opt/soundfonts
           ports:

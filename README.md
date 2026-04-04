@@ -1,4 +1,4 @@
-# MusescoreReader
+# Fumen
 
 Svelte frontend plus Rust backend for uploading MuseScore `.mscz` files, storing them in S3 or on local disk, and sharing public listening links.
 
@@ -111,20 +111,20 @@ This repository now includes three Docker build targets:
 Build the frontend image from the repository root:
 
 ```bash
-docker build -f Dockerfile.frontend -t musescore-reader-frontend .
+docker build -f Dockerfile.frontend -t fumen-frontend .
 ```
 
 Build the backend image from the repository root:
 
 ```bash
-docker build -f Dockerfile.backend -t musescore-reader-backend .
+docker build -f Dockerfile.backend -t fumen-backend .
 ```
 
 Build the soundfonts image from the repository root. The image reads `soundfonts/sources.json`,
 downloads each archive, and installs it under the matching key name:
 
 ```bash
-docker build -f Dockerfile.soundfonts -t musescore-reader-soundfonts .
+docker build -f Dockerfile.soundfonts -t fumen-soundfonts .
 ```
 
 The backend image defaults to:
@@ -137,12 +137,99 @@ SOUNDFONT_DIR=/opt/soundfonts
 
 For Kubernetes, the intended setup is:
 
-- run `musescore-reader-frontend` as the public web app
-- run `musescore-reader-backend` as the API service
-- mount the contents of `musescore-reader-soundfonts` into the backend pod at `/opt/soundfonts`
+- run `fumen-frontend` as the public web app
+- run `fumen-backend` as the API service
+- mount the contents of `fumen-soundfonts` into the backend pod at `/opt/soundfonts`
 
 The frontend image serves only static files. Route `/api` to the backend with Ingress or another
 cluster-level proxy.
 
 `Dockerfile.backend` includes `ffmpeg`, `fluidsynth`, `sfizz_render`, and MuseScore 4. The image
 sets `FLUIDSYNTH_BIN`, `SFIZZ_BIN`, and `MUSESCORE_BIN` automatically.
+
+## Helm deployment
+
+The Helm chart lives in [helm/](/Users/sygmei/Projects/MusescoreReader/helm) and expects a few
+cluster dependencies and secrets to exist beforehand.
+
+### Cluster dependencies
+
+- Traefik as the ingress controller
+- cert-manager installed in the cluster
+- Cloudflare DNS configured for the target domain
+
+### Required secrets
+
+Create these secrets in the target namespace before installing the chart.
+
+`postgresql-credentials` must contain:
+
+```yaml
+data:
+  connection-string: ...
+  connection-string-admin: ...
+  connection-string-ro: ...
+  database: ...
+  host: ...
+  host-ro: ...
+  password: ...
+  port: ...
+  username: ...
+```
+
+`cloudflare-secret` must contain a `token` key with a Cloudflare API token that can solve DNS01
+challenges for the domain:
+
+```bash
+kubectl -n <namespace> create secret generic cloudflare-secret \
+  --from-literal=token='<cloudflare-api-token>'
+```
+
+`s3-creds` must contain the S3 or Spaces credentials used by the backend. With DigitalOcean Spaces,
+you can create it like this:
+
+```bash
+kubectl -n <namespace> create secret generic s3-creds \
+  --from-literal=secret-key='<secret-key>' \
+  --from-literal=access-key-id='<access-key-id>' \
+  --from-literal=bucket-name='fumen' \
+  --from-literal=region-name='fra1' \
+  --from-literal=endpoint-url='https://fra1.digitaloceanspaces.com'
+```
+
+The chart maps those secret keys to:
+
+- `S3_SECRET_ACCESS_KEY` from `secret-key`
+- `S3_ACCESS_KEY_ID` from `access-key-id`
+- `S3_BUCKET` from `bucket-name`
+- `S3_REGION` from `region-name`
+- `S3_ENDPOINT` from `endpoint-url`
+
+### Admin password
+
+The backend still reads `ADMIN_PASSWORD`, but the Helm chart does not inject it yet. If you do not
+patch the Deployment, the backend falls back to the default password `fumen-admin`, which is
+not safe for production.
+
+### Install
+
+Update [helm/values.yaml](/Users/sygmei/Projects/MusescoreReader/helm/values.yaml) or override the
+image tags and domains on the command line, then install:
+
+```bash
+helm upgrade --install fumen ./helm \
+  --namespace <namespace> \
+  --create-namespace
+```
+
+The chart will create:
+
+- a cert-manager `Issuer`
+- a wildcard-style `Certificate` covering the frontend and backend hosts
+- a Traefik HTTPS redirect middleware
+- frontend and backend Deployments, Services, and Ingresses
+
+With the current defaults, the public hosts are:
+
+- frontend: `fumen.mydomain.com`
+- backend: `fumen-api.mydomain.com`

@@ -2,11 +2,11 @@ backend:
   version: "0.1.0"
   replicas: 1
   ingress:
-    domain: backend.example.com
+    domain: "fumen-api.lehang.art"
   soundfonts:
     version: "1.0.0"
 
 frontend:
   version: "0.1.0"
   ingress:
-    domain: app.example.com
+    domain: "fumen.lehang.art"

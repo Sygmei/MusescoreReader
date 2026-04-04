@@ -268,7 +268,7 @@ async fn ensure_stems_column(db: &PgPool, name: &str, definition: &str) -> Resul
 
 async fn root_message() -> impl IntoResponse {
     Json(serde_json::json!({
-        "message": "MuseScore Reader backend is running. Build the frontend to serve it from this process."
+        "message": "Fumen backend is running. Build the frontend to serve it from this process."
     }))
 }
 

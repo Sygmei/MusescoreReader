@@ -1,0 +1,16 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "fumen.certificateName" . }}
+spec:
+  secretName: {{ include "fumen.certificateSecretName" . }}
+  privateKey:
+    rotationPolicy: Always
+  issuerRef:
+    name: {{ include "fumen.issuerName" . }}
+    kind: Issuer
+  dnsNames:
+    - "*.{{ include "fumen.baseDomain" . }}"
+    - "{{ include "fumen.baseDomain" . }}"
+    - "{{ .Values.frontend.ingress.domain }}"
+    - "{{ .Values.backend.ingress.domain }}"

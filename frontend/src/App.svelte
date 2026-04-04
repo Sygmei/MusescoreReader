@@ -514,7 +514,7 @@
 {#if isPublicRoute}
   <main class="page public-shell">
     <section class="hero-panel">
-      <p class="eyebrow">MuseScore Reader</p>
+      <p class="eyebrow">Fumen</p>
       <h1>Listen to a shared score</h1>
       <p class="lede">
         This page plays high-quality per-instrument audio stems rendered by the backend with
@@ -679,7 +679,7 @@
 {:else}
   <main class="page admin-shell">
     <section class="hero-panel">
-      <p class="eyebrow">MuseScore Reader</p>
+      <p class="eyebrow">Fumen</p>
       <h1>Private upload desk</h1>
       <p class="lede">
         Upload `.mscz` scores, store them in the configured backend, and hand out either a random

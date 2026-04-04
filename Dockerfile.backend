@@ -95,7 +95,7 @@ RUN groupadd --system app \
 
 WORKDIR /app
 
-COPY --from=build /app/backend/target/release/backend /usr/local/bin/musescore-reader
+COPY --from=build /app/backend/target/release/fumen-backend /usr/local/bin/fumen
 COPY --from=sfizz-build /opt/sfizz/bin/sfizz_render /usr/local/bin/sfizz_render
 COPY --from=musescore-build /opt/musescore4 /opt/musescore4
 
@@ -116,4 +116,4 @@ USER app
 EXPOSE 3000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/musescore-reader"]
+CMD ["/usr/local/bin/fumen"]

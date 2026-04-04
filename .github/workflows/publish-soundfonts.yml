@@ -53,6 +53,6 @@ jobs:
           context: .
           file: ./Dockerfile.soundfonts
           push: true
-          tags: ghcr.io/sygmei/musescore-reader-soundfonts:${{ steps.version.outputs.version }}
+          tags: ghcr.io/sygmei/fumen-soundfonts:${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

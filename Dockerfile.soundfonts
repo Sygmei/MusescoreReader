@@ -43,3 +43,5 @@ RUN set -euo pipefail; \
 FROM alpine:3.22
 
 COPY --from=build /opt/soundfonts /opt/soundfonts
+
+USER 65532:65532

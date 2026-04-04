@@ -36,7 +36,7 @@ impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let bind_address = env::var("BIND_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".to_owned());
         let admin_password =
-            env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "musescore-admin".to_owned());
+            env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "fumen-admin".to_owned());
         let app_base_url =
             env::var("APP_BASE_URL").unwrap_or_else(|_| "http://localhost:5173".to_owned());
         let database_url = env::var("DATABASE_URL")
