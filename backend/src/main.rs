@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::{net::SocketAddr, path::PathBuf};
 use storage::Storage;
 use tokio::fs;
+use tokio::process::Command;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -150,6 +151,10 @@ async fn main() -> Result<()> {
         .route("/public/{access_key}/musicxml", get(public_music_musicxml))
         .route("/public/{access_key}/stems", get(public_music_stems))
         .route("/public/{access_key}/stems/{track_index}", get(public_music_stem_audio))
+        .route(
+            "/public/{access_key}/stems/{track_index}/chunks/{chunk_index}",
+            get(public_music_stem_chunk_audio),
+        )
         .route("/public/{access_key}/download", get(public_music_download))
         .with_state(state.clone());
 
@@ -216,6 +221,7 @@ async fn ensure_schema(db: &PgPool) -> Result<()> {
             stems_error TEXT,
             public_token TEXT NOT NULL UNIQUE,
             public_id TEXT UNIQUE,
+            quality_profile TEXT NOT NULL DEFAULT 'standard',
             created_at TEXT NOT NULL
         )
         "#,
@@ -250,6 +256,15 @@ async fn ensure_schema(db: &PgPool) -> Result<()> {
     ensure_music_column(db, "musicxml_object_key", "TEXT").await?;
     ensure_music_column(db, "musicxml_status", "TEXT NOT NULL DEFAULT 'unavailable'").await?;
     ensure_music_column(db, "musicxml_error", "TEXT").await?;
+    ensure_music_column(
+        db,
+        "quality_profile",
+        &format!(
+            "TEXT NOT NULL DEFAULT '{}'",
+            audio::DEFAULT_STEM_QUALITY_PROFILE
+        ),
+    )
+    .await?;
     ensure_stems_column(db, "size_bytes", "BIGINT NOT NULL DEFAULT 0").await?;
 
     Ok(())
@@ -292,6 +307,13 @@ async fn admin_login(
 struct StemsTotalRow {
     music_id: String,
     total_bytes: i64,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct StemChunkManifest {
+    chunk_count: i64,
+    chunk_duration_seconds: f64,
+    duration_seconds: f64,
 }
 
 async fn fetch_stems_total(db: &PgPool, music_id: &str) -> i64 {
@@ -364,7 +386,7 @@ async fn admin_list_musics(
 
     let rows = sqlx::query_as::<_, MusicRecord>(
         r#"
-        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, created_at
+        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, quality_profile, created_at
         FROM musics
         ORDER BY created_at DESC
         "#,
@@ -385,7 +407,7 @@ async fn admin_list_musics(
         .into_iter()
         .map(|record| {
             let total = totals.get(&record.id).copied().unwrap_or(0);
-            record_to_admin_response(&state.config, record, total)
+            record_to_admin_response(&state.config, &state.storage, record, total)
         })
         .collect();
 
@@ -401,6 +423,7 @@ async fn admin_upload_music(
 
     let mut title: Option<String> = None;
     let mut requested_public_id: Option<String> = None;
+    let mut requested_quality_profile: Option<String> = None;
     let mut upload: Option<(String, String, Bytes)> = None;
 
     while let Some(field) = multipart.next_field().await? {
@@ -410,6 +433,9 @@ async fn admin_upload_music(
             }
             Some("public_id") => {
                 requested_public_id = Some(field.text().await?.trim().to_owned());
+            }
+            Some("quality_profile") => {
+                requested_quality_profile = Some(field.text().await?.trim().to_owned());
             }
             Some("file") => {
                 let filename = field.file_name().map(ToOwned::to_owned).ok_or_else(|| {
@@ -434,6 +460,7 @@ async fn admin_upload_music(
 
     let public_id = normalize_public_id(requested_public_id.as_deref())?;
     ensure_public_id_available(&state.db_rw, public_id.as_deref(), None).await?;
+    let quality_profile = parse_quality_profile(requested_quality_profile.as_deref())?;
 
     let music_id = Uuid::new_v4().to_string();
     let public_token = generate_public_token();
@@ -466,15 +493,16 @@ async fn admin_upload_music(
     )?;
 
     let (stem_results, stems_status, stems_error) =
-        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path()).await?;
+        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path(), quality_profile)
+            .await?;
 
     // Insert the musics row BEFORE running store_stems so the FK constraint is satisfied.
     // Conversion-result columns have DEFAULT values and will be updated below.
     let created_at = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
-        INSERT INTO musics (id, title, filename, content_type, object_key, public_token, public_id, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO musics (id, title, filename, content_type, object_key, public_token, public_id, quality_profile, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         "#,
     )
     .bind(&music_id)
@@ -484,6 +512,7 @@ async fn admin_upload_music(
     .bind(&object_key)
     .bind(&public_token)
     .bind(&public_id)
+    .bind(quality_profile.as_str())
     .bind(&created_at)
     .execute(&state.db_rw)
     .await?;
@@ -550,11 +579,17 @@ async fn admin_upload_music(
         stems_error,
         public_token,
         public_id,
+        quality_profile: quality_profile.as_str().to_owned(),
         created_at,
     };
 
     let stems_total = fetch_stems_total(&state.db_rw, &record.id).await;
-    Ok(Json(record_to_admin_response(&state.config, record, stems_total)))
+    Ok(Json(record_to_admin_response(
+        &state.config,
+        &state.storage,
+        record,
+        stems_total,
+    )))
 }
 
 async fn admin_retry_render(
@@ -567,6 +602,7 @@ async fn admin_retry_render(
     let record = find_music_by_id(&state.db_rw, &id)
         .await?
         .ok_or_else(|| AppError::not_found("Music not found"))?;
+    let quality_profile = audio::StemQualityProfile::from_stored_or_default(&record.quality_profile);
 
     // Fetch the original score bytes from storage.
     let (score_bytes, _) = state.storage.get_bytes(&record.object_key).await?;
@@ -593,7 +629,8 @@ async fn admin_retry_render(
         .await?;
 
     let (stem_results, stems_status, stems_error) =
-        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path()).await?;
+        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path(), quality_profile)
+            .await?;
 
     let (stems_status, stems_error) =
         store_stems(&state, &id, stem_results, stems_status, stems_error).await?;
@@ -621,7 +658,12 @@ async fn admin_retry_render(
         .ok_or_else(|| AppError::not_found("Music not found"))?;
 
     let stems_total = fetch_stems_total(&state.db_rw, &id).await;
-    Ok(Json(record_to_admin_response(&state.config, updated, stems_total)))
+    Ok(Json(record_to_admin_response(
+        &state.config,
+        &state.storage,
+        updated,
+        stems_total,
+    )))
 }
 
 async fn store_stems(
@@ -633,11 +675,41 @@ async fn store_stems(
 ) -> Result<(String, Option<String>), AppError> {
     for stem in stems {
         let size_bytes = stem.bytes.len() as i64;
-        let storage_key = format!("stems/{}/{}.ogg", music_id, stem.track_index);
+        let storage_key = stem_full_key(music_id, stem.track_index);
         state
             .storage
-            .upload_bytes(&storage_key, stem.bytes, "audio/ogg")
+            .upload_bytes(&storage_key, stem.bytes.clone(), "audio/ogg")
             .await?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let full_stem_path = temp_dir.path().join("stem.ogg");
+        fs::write(&full_stem_path, &stem.bytes).await?;
+
+        let duration_seconds = probe_audio_duration_seconds(&full_stem_path).await?;
+        let chunk_count = chunk_stem_file(
+            state,
+            music_id,
+            stem.track_index,
+            &full_stem_path,
+        )
+        .await?;
+        let manifest = StemChunkManifest {
+            chunk_count,
+            chunk_duration_seconds: audio::STEM_CHUNK_DURATION_SECONDS as f64,
+            duration_seconds,
+        };
+        let manifest_key = stem_manifest_key(music_id, stem.track_index as i64);
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| AppError::from(anyhow::anyhow!(error)))?;
+        state
+            .storage
+            .upload_bytes(
+                &manifest_key,
+                Bytes::from(manifest_bytes),
+                "application/json",
+            )
+            .await?;
+
         sqlx::query(
             "INSERT INTO stems (music_id, track_index, track_name, instrument_name, storage_key, size_bytes) \
              VALUES ($1, $2, $3, $4, $5, $6)",
@@ -654,6 +726,92 @@ async fn store_stems(
     Ok((status, error))
 }
 
+async fn chunk_stem_file(
+    state: &AppState,
+    music_id: &str,
+    track_index: usize,
+    full_stem_path: &std::path::Path,
+) -> Result<i64, AppError> {
+    let chunk_dir = tempfile::tempdir()?;
+    let chunk_pattern = chunk_dir.path().join("chunk_%05d.ogg");
+    let ffmpeg_output = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i")
+        .arg(full_stem_path)
+        .arg("-map")
+        .arg("0:a:0")
+        .arg("-c")
+        .arg("copy")
+        .arg("-f")
+        .arg("segment")
+        .arg("-segment_time")
+        .arg(audio::STEM_CHUNK_DURATION_SECONDS.to_string())
+        .arg("-reset_timestamps")
+        .arg("1")
+        .arg(&chunk_pattern)
+        .output()
+        .await
+        .map_err(AppError::from)?;
+
+    if !ffmpeg_output.status.success() {
+        return Err(AppError::from(anyhow::anyhow!(
+            "ffmpeg chunking failed: {}",
+            String::from_utf8_lossy(&ffmpeg_output.stderr).trim()
+        )));
+    }
+
+    let mut entries = tokio::fs::read_dir(chunk_dir.path()).await?;
+    let mut chunk_paths = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("ogg") {
+            chunk_paths.push(path);
+        }
+    }
+    chunk_paths.sort();
+
+    for (chunk_index, chunk_path) in chunk_paths.iter().enumerate() {
+        let bytes = fs::read(chunk_path).await?;
+        state
+            .storage
+            .upload_bytes(
+                &stem_chunk_key(music_id, track_index as i64, chunk_index as i64),
+                Bytes::from(bytes),
+                "audio/ogg",
+            )
+            .await?;
+    }
+
+    Ok(chunk_paths.len() as i64)
+}
+
+async fn probe_audio_duration_seconds(path: &std::path::Path) -> Result<f64, AppError> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-show_entries")
+        .arg("format=duration")
+        .arg("-of")
+        .arg("default=noprint_wrappers=1:nokey=1")
+        .arg(path)
+        .output()
+        .await
+        .map_err(AppError::from)?;
+
+    if !output.status.success() {
+        return Err(AppError::from(anyhow::anyhow!(
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let duration = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|error| AppError::from(anyhow::anyhow!("invalid ffprobe duration: {error}")))?;
+    Ok(duration)
+}
+
 async fn public_music_stems(
     State(state): State<AppState>,
     Path(access_key): Path<String>,
@@ -664,17 +822,58 @@ async fn public_music_stems(
 
     let stems = find_public_stems(&state.db_ro, &state.db_rw, &record.id).await?;
 
-    let infos = stems
-        .into_iter()
-        .map(|s| StemInfo {
-            track_index: s.track_index,
-            track_name: s.track_name,
-            instrument_name: s.instrument_name,
-            stream_url: format!("/api/public/{}/stems/{}", access_key, s.track_index),
-        })
-        .collect();
+    let mut resolved_infos = Vec::new();
+    for stem in stems {
+        let manifest_key = stem_manifest_key(&record.id, stem.track_index);
+        let legacy_stem_url = state
+            .storage
+            .public_url(&stem.storage_key)
+            .unwrap_or_else(|| format!("/api/public/{}/stems/{}", access_key, stem.track_index));
+        let (chunk_url_template, manifest) = match state.storage.get_bytes(&manifest_key).await {
+            Ok((bytes, _)) => {
+                let manifest: StemChunkManifest = serde_json::from_slice(&bytes)
+                    .map_err(|error| AppError::from(anyhow::anyhow!(error)))?;
+                let chunk_url_template = state
+                    .storage
+                    .public_url(&stem_chunk_url_template_key(&record.id, stem.track_index))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "/api/public/{}/stems/{}/chunks/__CHUNK_INDEX__",
+                            access_key, stem.track_index
+                        )
+                    });
+                (chunk_url_template, manifest)
+            }
+            Err(_) => {
+                let (stem_bytes, _) = state.storage.get_bytes(&stem.storage_key).await?;
+                let temp_dir = tempfile::tempdir()?;
+                let full_stem_path = temp_dir.path().join("stem.ogg");
+                fs::write(&full_stem_path, stem_bytes).await?;
+                let duration_seconds = probe_audio_duration_seconds(&full_stem_path).await?;
 
-    Ok(Json(infos))
+                (
+                    legacy_stem_url,
+                    StemChunkManifest {
+                        chunk_count: 1,
+                        chunk_duration_seconds: duration_seconds,
+                        duration_seconds,
+                    },
+                )
+            }
+        };
+
+        resolved_infos.push(StemInfo {
+            track_index: stem.track_index,
+            track_name: stem.track_name,
+            instrument_name: stem.instrument_name,
+            chunk_url_template,
+            chunk_count: manifest.chunk_count,
+            chunk_duration_seconds: manifest.chunk_duration_seconds,
+            duration_seconds: manifest.duration_seconds,
+        });
+    }
+
+    Ok(Json(resolved_infos))
 }
 
 async fn public_music_stem_audio(
@@ -694,6 +893,27 @@ async fn public_music_stem_audio(
         bytes,
         content_type.unwrap_or_else(|| "audio/ogg".to_owned()),
         Some(format!("inline; filename=\"{}.ogg\"", stem.track_name)),
+    ))
+}
+
+async fn public_music_stem_chunk_audio(
+    State(state): State<AppState>,
+    Path((access_key, track_index, chunk_index)): Path<(String, i64, i64)>,
+) -> Result<Response, AppError> {
+    let record = find_public_music_record(&state, &access_key)
+        .await?
+        .ok_or_else(|| AppError::not_found("Music not found"))?;
+
+    find_public_stem(&state.db_ro, &state.db_rw, &record.id, track_index)
+        .await?
+        .ok_or_else(|| AppError::not_found("Stem not found"))?;
+
+    let chunk_key = stem_chunk_key(&record.id, track_index, chunk_index);
+    let (bytes, content_type) = state.storage.get_bytes(&chunk_key).await?;
+    Ok(binary_response(
+        bytes,
+        content_type.unwrap_or_else(|| "audio/ogg".to_owned()),
+        Some(format!("inline; filename=\"stem-{track_index}-{chunk_index}.ogg\"")),
     ))
 }
 
@@ -752,7 +972,12 @@ async fn admin_update_music(
         .ok_or_else(|| AppError::not_found("Music not found"))?;
 
     let stems_total = fetch_stems_total(&state.db_rw, &id).await;
-    Ok(Json(record_to_admin_response(&state.config, record, stems_total)))
+    Ok(Json(record_to_admin_response(
+        &state.config,
+        &state.storage,
+        record,
+        stems_total,
+    )))
 }
 
 async fn public_music(
@@ -763,7 +988,11 @@ async fn public_music(
         .await?
         .ok_or_else(|| AppError::not_found("Music not found"))?;
 
-    Ok(Json(record_to_public_response(record, &access_key)))
+    Ok(Json(record_to_public_response(
+        &state.storage,
+        record,
+        &access_key,
+    )))
 }
 
 async fn public_music_audio(
@@ -894,7 +1123,7 @@ async fn ensure_public_id_available(
 async fn find_music_by_id(db: &PgPool, id: &str) -> Result<Option<MusicRecord>> {
     Ok(sqlx::query_as::<_, MusicRecord>(
         r#"
-        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, created_at
+        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, quality_profile, created_at
         FROM musics
         WHERE id = $1
         "#,
@@ -910,7 +1139,7 @@ async fn find_music_by_access_key(
 ) -> Result<Option<MusicRecord>> {
     Ok(sqlx::query_as::<_, MusicRecord>(
         r#"
-        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, created_at
+        SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, quality_profile, created_at
         FROM musics
         WHERE public_token = $1 OR public_id = $2
         LIMIT 1
@@ -922,7 +1151,12 @@ async fn find_music_by_access_key(
     .await?)
 }
 
-fn record_to_admin_response(config: &AppConfig, record: MusicRecord, stems_total_bytes: i64) -> AdminMusicResponse {
+fn record_to_admin_response(
+    config: &AppConfig,
+    storage: &Storage,
+    record: MusicRecord,
+    stems_total_bytes: i64,
+) -> AdminMusicResponse {
     let public_id_url = record
         .public_id
         .as_ref()
@@ -930,7 +1164,14 @@ fn record_to_admin_response(config: &AppConfig, record: MusicRecord, stems_total
     let midi_download_url = record
         .midi_object_key
         .as_ref()
-        .map(|_| format!("/api/public/{}/midi", record.public_token));
+        .map(|object_key| {
+            storage
+                .public_url(object_key)
+                .unwrap_or_else(|| format!("/api/public/{}/midi", record.public_token))
+        });
+    let download_url = storage
+        .public_url(&record.object_key)
+        .unwrap_or_else(|| format!("/api/public/{}/download", record.public_token));
 
     AdminMusicResponse {
         id: record.id,
@@ -949,34 +1190,52 @@ fn record_to_admin_response(config: &AppConfig, record: MusicRecord, stems_total
         public_id: record.public_id,
         public_url: config.public_url_for(&record.public_token),
         public_id_url,
-        download_url: format!("/api/public/{}/download", record.public_token),
+        download_url,
         midi_download_url,
+        quality_profile: record.quality_profile,
         created_at: record.created_at,
         stems_total_bytes,
     }
 }
 
-fn record_to_public_response(record: MusicRecord, access_key: &str) -> PublicMusicResponse {
+fn record_to_public_response(
+    storage: &Storage,
+    record: MusicRecord,
+    access_key: &str,
+) -> PublicMusicResponse {
+    let audio_stream_url = record.audio_object_key.as_ref().map(|object_key| {
+        storage
+            .public_url(object_key)
+            .unwrap_or_else(|| format!("/api/public/{access_key}/audio"))
+    });
+    let midi_download_url = record.midi_object_key.as_ref().map(|object_key| {
+        storage
+            .public_url(object_key)
+            .unwrap_or_else(|| format!("/api/public/{access_key}/midi"))
+    });
+    let musicxml_url = record.musicxml_object_key.as_ref().map(|object_key| {
+        storage
+            .public_url(object_key)
+            .unwrap_or_else(|| format!("/api/public/{access_key}/musicxml"))
+    });
+    let download_url = storage
+        .public_url(&record.object_key)
+        .unwrap_or_else(|| format!("/api/public/{access_key}/download"));
+
     PublicMusicResponse {
         title: record.title,
         filename: record.filename,
         audio_status: record.audio_status,
         audio_error: record.audio_error,
-        can_stream_audio: record.audio_object_key.is_some(),
-        audio_stream_url: record
-            .audio_object_key
-            .map(|_| format!("/api/public/{access_key}/audio")),
+        can_stream_audio: audio_stream_url.is_some(),
+        audio_stream_url,
         midi_status: record.midi_status,
         midi_error: record.midi_error,
-        midi_download_url: record
-            .midi_object_key
-            .map(|_| format!("/api/public/{access_key}/midi")),
-        musicxml_url: record
-            .musicxml_object_key
-            .map(|_| format!("/api/public/{access_key}/musicxml")),
+        midi_download_url,
+        musicxml_url,
         stems_status: record.stems_status,
         stems_error: record.stems_error,
-        download_url: format!("/api/public/{access_key}/download"),
+        download_url,
         created_at: record.created_at,
     }
 }
@@ -987,6 +1246,21 @@ fn generate_public_token() -> String {
         .take(24)
         .map(char::from)
         .collect()
+}
+
+fn parse_quality_profile(
+    raw: Option<&str>,
+) -> Result<audio::StemQualityProfile, AppError> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(audio::DEFAULT_STEM_QUALITY_PROFILE);
+
+    audio::StemQualityProfile::from_slug(value).ok_or_else(|| {
+        AppError::bad_request(
+            "Invalid quality profile. Use one of: compact, standard, high.",
+        )
+    })
 }
 
 fn normalize_public_id(raw: Option<&str>) -> Result<Option<String>, AppError> {
@@ -1046,6 +1320,22 @@ fn midi_filename_for(filename: &str) -> String {
         .trim_end_matches(".mscx")
         .trim_end_matches(".MSCX");
     sanitize_content_disposition(&format!("{stem}.mid"))
+}
+
+fn stem_full_key(music_id: &str, track_index: usize) -> String {
+    format!("stems/{music_id}/{track_index}.ogg")
+}
+
+fn stem_manifest_key(music_id: &str, track_index: i64) -> String {
+    format!("stems/{music_id}/{track_index}/manifest.json")
+}
+
+fn stem_chunk_key(music_id: &str, track_index: i64, chunk_index: i64) -> String {
+    format!("stems/{music_id}/{track_index}/chunks/{chunk_index}.ogg")
+}
+
+fn stem_chunk_url_template_key(music_id: &str, track_index: i64) -> String {
+    format!("stems/{music_id}/{track_index}/chunks/__CHUNK_INDEX__.ogg")
 }
 
 fn binary_response(

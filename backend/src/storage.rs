@@ -5,6 +5,7 @@ use aws_sdk_s3::{
     Client,
     config::{BehaviorVersion, Region},
     primitives::ByteStream,
+    types::ObjectCannedAcl,
 };
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,11 @@ pub struct Storage {
 #[derive(Clone)]
 enum StorageBackend {
     Local { root: PathBuf },
-    S3 { bucket: String, client: Client },
+    S3 {
+        bucket: String,
+        client: Client,
+        public_base_url: String,
+    },
 }
 
 impl Storage {
@@ -31,6 +36,7 @@ impl Storage {
             StorageConfig::S3(s3) => StorageBackend::S3 {
                 bucket: s3.bucket.clone(),
                 client: build_s3_client(s3),
+                public_base_url: build_s3_public_base_url(s3),
             },
         };
 
@@ -49,11 +55,12 @@ impl Storage {
                 let _ = content_type;
                 Ok(())
             }
-            StorageBackend::S3 { bucket, client } => {
+            StorageBackend::S3 { bucket, client, .. } => {
                 client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
+                    .acl(ObjectCannedAcl::PublicRead)
                     .content_type(content_type)
                     .body(ByteStream::from(bytes.to_vec()))
                     .send()
@@ -70,12 +77,25 @@ impl Storage {
                 let bytes = fs::read(path).await?;
                 Ok((Bytes::from(bytes), None))
             }
-            StorageBackend::S3 { bucket, client } => {
+            StorageBackend::S3 { bucket, client, .. } => {
                 let response = client.get_object().bucket(bucket).key(key).send().await?;
                 let content_type = response.content_type().map(ToOwned::to_owned);
                 let bytes = response.body.collect().await?.into_bytes();
                 Ok((bytes, content_type))
             }
+        }
+    }
+
+    pub fn public_url(&self, key: &str) -> Option<String> {
+        match &self.backend {
+            StorageBackend::Local { .. } => None,
+            StorageBackend::S3 {
+                public_base_url, ..
+            } => Some(format!(
+                "{}/{}",
+                public_base_url.trim_end_matches('/'),
+                key.trim_start_matches('/'),
+            )),
         }
     }
 }
@@ -101,6 +121,33 @@ fn build_s3_client(config: &S3Config) -> Client {
     }
 
     Client::from_conf(s3_config.build())
+}
+
+fn build_s3_public_base_url(config: &S3Config) -> String {
+    if let Some(endpoint) = &config.endpoint {
+        let endpoint = endpoint.trim_end_matches('/');
+
+        if config.force_path_style {
+            return format!("{}/{}", endpoint, config.bucket);
+        }
+
+        if let Some((scheme, rest)) = endpoint.split_once("://") {
+            if rest.starts_with(&format!("{}.", config.bucket)) {
+                endpoint.to_owned()
+            } else {
+                format!("{scheme}://{}.{}", config.bucket, rest)
+            }
+        } else if endpoint.starts_with(&format!("{}.", config.bucket)) {
+            format!("https://{endpoint}")
+        } else {
+            format!("https://{}.{}", config.bucket, endpoint)
+        }
+    } else {
+        format!(
+            "https://{}.s3.{}.amazonaws.com",
+            config.bucket, config.region
+        )
+    }
 }
 
 fn path_for_key(root: &Path, key: &str) -> PathBuf {

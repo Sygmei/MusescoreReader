@@ -56,16 +56,19 @@ export class ScoreViewer {
 
     const { OpenSheetMusicDisplay } = await import('opensheetmusicdisplay')
 
-    this.osmd = new OpenSheetMusicDisplay(this.container, {
-      autoResize: false,
-      backend: 'svg',
-      drawTitle: false,
-      drawSubtitle: false,
-      drawComposer: false,
-      drawCursors: true,
-      followCursor: false,
-      zoom: 0.35,
-    })
+    this.osmd = new OpenSheetMusicDisplay(
+      this.container,
+      {
+        autoResize: false,
+        backend: 'svg',
+        drawTitle: false,
+        drawSubtitle: false,
+        drawComposer: false,
+        drawCursors: true,
+        followCursor: false,
+        zoom: 0.35,
+      } as Record<string, unknown>,
+    )
 
     await this.osmd.load(xmlText)
 

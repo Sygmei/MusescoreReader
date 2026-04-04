@@ -6,11 +6,13 @@
     listMusics,
     login,
     retryRender,
+    STEM_QUALITY_PROFILES,
     updatePublicId,
     uploadMusic,
     type AdminMusic,
     type PublicMusic,
     type Stem,
+    type StemQualityProfile,
   } from './lib/api'
   import { MidiMixerPlayer, type MixerTrack } from './lib/midi-player'
   import { StemMixerPlayer, type StemTrack } from './lib/stem-mixer'
@@ -30,6 +32,7 @@
   let adminSuccess = ''
   let uploadTitle = ''
   let uploadPublicId = ''
+  let uploadQualityProfile: StemQualityProfile = 'standard'
   let selectedFile: File | null = null
   let uploadBusy = false
   let musics: AdminMusic[] = []
@@ -40,6 +43,7 @@
   let publicMusic: PublicMusic | null = null
   let publicLoading = false
   let publicError = ''
+  let mixerRequested = false
 
   let scoreViewer: ScoreViewer | null = null
   let scoreContainer: HTMLElement | null = null
@@ -126,10 +130,12 @@
         file: selectedFile,
         title: uploadTitle,
         publicId: uploadPublicId,
+        qualityProfile: uploadQualityProfile,
       })
 
       uploadTitle = ''
       uploadPublicId = ''
+      uploadQualityProfile = 'standard'
       selectedFile = null
       const input = document.getElementById('mscz-input') as HTMLInputElement | null
       if (input) {
@@ -205,13 +211,7 @@
       publicLoading = false
       await tick()
       await resetMixers()
-
-      const mixerTask =
-        music.stems_status === 'ready'
-          ? loadStemMixer(accessKey)
-          : music.midi_download_url
-            ? loadMidiMixer(music.midi_download_url)
-            : Promise.resolve()
+      mixerRequested = false
 
       let scoreTask: Promise<void> = Promise.resolve()
       if (music.musicxml_url && scoreContainer) {
@@ -233,7 +233,7 @@
           })
       }
 
-      await Promise.all([mixerTask, scoreTask])
+      await scoreTask
     } catch (error) {
       publicError = error instanceof Error ? error.message : 'Unable to load this score'
     } finally {
@@ -267,6 +267,7 @@
     scoreLoading = false
     scoreLoaded = false
     scoreError = ''
+    mixerRequested = false
   }
 
   async function loadStemMixer(accessKey: string) {
@@ -289,7 +290,10 @@
           id: String(s.track_index),
           name: s.track_name,
           instrumentName: s.instrument_name,
-          streamUrl: s.stream_url,
+          chunkUrlTemplate: s.chunk_url_template,
+          chunkCount: s.chunk_count,
+          chunkDurationSeconds: s.chunk_duration_seconds,
+          durationSeconds: s.duration_seconds,
         })),
       )
       stemPlayer.setLevelMultiplier(15)
@@ -326,6 +330,22 @@
       midiPlayerError = error instanceof Error ? error.message : 'Unable to prepare MIDI playback'
     } finally {
       midiLoading = false
+    }
+  }
+
+  async function openMixer() {
+    if (!publicMusic || midiLoading || mixerTracks.length > 0) {
+      mixerRequested = true
+      return
+    }
+
+    mixerRequested = true
+    if (publicMusic.stems_status === 'ready' && publicAccessKey) {
+      await loadStemMixer(publicAccessKey)
+      return
+    }
+    if (publicMusic.midi_download_url) {
+      await loadMidiMixer(publicMusic.midi_download_url)
     }
   }
 
@@ -509,6 +529,10 @@
   function percentVolume(volume: number) {
     return Math.round(volume * 100)
   }
+
+  function qualityProfileLabel(profile: string) {
+    return STEM_QUALITY_PROFILES.find((option) => option.value === profile)?.label ?? profile
+  }
 </script>
 
 {#if isPublicRoute}
@@ -560,6 +584,34 @@
             <p class="status">Loading score…</p>
           {:else if scoreError}
             <p class="status error">Score: {scoreError}</p>
+          {/if}
+
+          {#if publicMusic.audio_stream_url}
+            <div class="fallback-player">
+              <p class="hint">
+                Use the preview for instant playback. Open the mixer only when you want
+                per-instrument control.
+              </p>
+              <audio class="player" controls preload="metadata" src={publicMusic.audio_stream_url}>
+                Your browser does not support audio playback.
+              </audio>
+            </div>
+          {/if}
+
+          {#if publicMusic.stems_status === 'ready' || publicMusic.midi_download_url}
+            <div class="actions">
+              <button class="button" on:click={openMixer}>
+                {mixerTracks.length > 0
+                  ? 'Mixer Ready'
+                  : midiLoading
+                    ? 'Preparing Mixer...'
+                    : publicMusic.stems_status === 'ready'
+                      ? 'Open Stem Mixer'
+                      : playerMode === 'midi'
+                      ? 'Open MIDI Mixer'
+                      : 'Open MIDI Mixer'}
+              </button>
+            </div>
           {/if}
 
           {#if midiLoading}
@@ -631,19 +683,9 @@
                 {/each}
               </div>
             </div>
-          {:else if publicMusic.can_stream_audio && publicMusic.audio_stream_url}
-            <div class="fallback-player">
-              <p class="hint">
-                Per-instrument stems are not available; playing the mixed audio preview instead.
-                Individual volume control is not possible in this mode.
-              </p>
-              <audio class="player" controls preload="metadata" src={publicMusic.audio_stream_url}>
-                Your browser does not support audio playback.
-              </audio>
-            </div>
-          {:else}
+          {:else if mixerRequested}
             <p class="hint">
-              Playback is not available yet.
+              Mixer playback is not available yet.
               {#if publicMusic.stems_error}
                 <br />
                 <span>Stems: {publicMusic.stems_error}</span>
@@ -652,6 +694,10 @@
                 <br />
                 <span>MIDI: {publicMusic.midi_error}</span>
               {/if}
+            </p>
+          {:else}
+            <p class="hint">
+              Open the mixer when you want per-instrument volume control.
             </p>
           {/if}
 
@@ -732,6 +778,17 @@
               <span>Public id</span>
               <input bind:value={uploadPublicId} placeholder="Optional friendly id" />
             </label>
+            <label class="field">
+              <span>Stem quality</span>
+              <select bind:value={uploadQualityProfile}>
+                {#each STEM_QUALITY_PROFILES as option}
+                  <option value={option.value}>{option.label} ({option.value === 'standard' ? '32k' : option.value === 'compact' ? '24k' : '48k'})</option>
+                {/each}
+              </select>
+              <small class="subtle">
+                {STEM_QUALITY_PROFILES.find((option) => option.value === uploadQualityProfile)?.description}
+              </small>
+            </label>
             <label class="field file-field">
               <span>MSCZ file</span>
               <input
@@ -795,6 +852,10 @@
                     <div>
                       <p class="meta-label">Audio export</p>
                       <p>{music.audio_status}</p>
+                    </div>
+                    <div>
+                      <p class="meta-label">Quality</p>
+                      <p>{qualityProfileLabel(music.quality_profile)}</p>
                     </div>
                     <div>
                       <p class="meta-label">Stems</p>

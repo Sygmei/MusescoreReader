@@ -51,6 +51,11 @@ $env:MUSESCORE_BIN="C:\Program Files\MuseScore Studio 4\bin\MuseScoreStudio.exe"
 
 If `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` are all unset, the backend stores uploaded files under `LOCAL_STORAGE_PATH`.
 
+When S3 storage is enabled, uploaded score files and generated derivatives are written as public
+objects and the API returns direct object URLs to the frontend. Use a bucket/endpoint that is meant
+to be publicly readable. The bucket must also allow browser CORS from the frontend origin if the
+browser will fetch MIDI, MusicXML, or stem audio directly.
+
 `DATABASE_URL` is the read-write application connection. `DATABASE_URL_ADMIN` is used for startup
 schema management, and `DATABASE_URL_READ_ONLY` is used for public read traffic. If the admin or
 read-only URLs are unset, the backend falls back to `DATABASE_URL`.

@@ -15,9 +15,34 @@ export type AdminMusic = {
   public_id_url: string | null
   download_url: string
   midi_download_url: string | null
+  quality_profile: StemQualityProfile
   created_at: string
   stems_total_bytes: number
 }
+
+export type StemQualityProfile = 'compact' | 'standard' | 'high'
+
+export const STEM_QUALITY_PROFILES: Array<{
+  value: StemQualityProfile
+  label: string
+  description: string
+}> = [
+  {
+    value: 'compact',
+    label: 'Compact',
+    description: 'Smaller stem files with more aggressive Opus compression at 24k.',
+  },
+  {
+    value: 'standard',
+    label: 'Standard',
+    description: 'Balanced stem quality and size at 32k.',
+  },
+  {
+    value: 'high',
+    label: 'High',
+    description: 'Higher stem quality with larger files at 48k.',
+  },
+]
 
 export type PublicMusic = {
   title: string
@@ -40,7 +65,10 @@ export type Stem = {
   track_index: number
   track_name: string
   instrument_name: string
-  stream_url: string
+  chunk_url_template: string
+  chunk_count: number
+  chunk_duration_seconds: number
+  duration_seconds: number
 }
 
 type JsonOptions = RequestInit & {
@@ -96,12 +124,13 @@ export async function listMusics(password: string): Promise<AdminMusic[]> {
 
 export async function uploadMusic(
   password: string,
-  payload: { file: File; title: string; publicId: string },
+  payload: { file: File; title: string; publicId: string; qualityProfile: StemQualityProfile },
 ): Promise<AdminMusic> {
   const body = new FormData()
   body.append('file', payload.file)
   body.append('title', payload.title)
   body.append('public_id', payload.publicId)
+  body.append('quality_profile', payload.qualityProfile)
 
   return requestJson<AdminMusic>('/api/admin/musics', {
     method: 'POST',

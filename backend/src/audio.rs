@@ -6,6 +6,47 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+pub const STEM_CHUNK_DURATION_SECONDS: u32 = 4;
+pub const DEFAULT_STEM_QUALITY_PROFILE: &str = "standard";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StemQualityProfile {
+    Compact,
+    Standard,
+    High,
+}
+
+impl StemQualityProfile {
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "standard" => Some(Self::Standard),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn from_stored_or_default(value: &str) -> Self {
+        Self::from_slug(value).unwrap_or(Self::Standard)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Standard => "standard",
+            Self::High => "high",
+        }
+    }
+
+    pub fn opus_bitrate(self) -> &'static str {
+        match self {
+            Self::Compact => "24k",
+            Self::Standard => "32k",
+            Self::High => "48k",
+        }
+    }
+}
+
 /// A `programs` entry can be either a plain SFZ path string (for
 /// instruments with a single articulation) or a detail object that bundles
 /// the sustain SFZ together with optional staccato, vibrato and in-track
@@ -143,10 +184,16 @@ pub async fn generate_stems(
     config: &AppConfig,
     input_path: &Path,
     output_dir: &Path,
+    quality_profile: StemQualityProfile,
 ) -> Result<(Vec<StemResult>, String, Option<String>)> {
     // --- pre-flight checks ---------------------------------------------------
 
-    tracing::info!("stems: starting pipeline for '{}'", input_path.file_name().unwrap_or_default().to_string_lossy());
+    tracing::info!(
+        "stems: starting pipeline for '{}' with {} profile ({})",
+        input_path.file_name().unwrap_or_default().to_string_lossy(),
+        quality_profile.as_str(),
+        quality_profile.opus_bitrate(),
+    );
 
     let sfizz = match find_sfizz_binary(config).await {
         Some(bin) => bin,
@@ -792,7 +839,7 @@ pub async fn generate_stems(
                 .arg("-c:a")
                 .arg("libopus")
                 .arg("-b:a")
-                .arg("64k")
+                .arg(quality_profile.opus_bitrate())
                 .arg("-ac")
                 .arg("1")
                 .arg("-application")

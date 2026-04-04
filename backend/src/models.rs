@@ -21,6 +21,7 @@ pub struct MusicRecord {
     pub stems_error: Option<String>,
     pub public_token: String,
     pub public_id: Option<String>,
+    pub quality_profile: String,
     pub created_at: String,
 }
 
@@ -54,7 +55,10 @@ pub struct StemInfo {
     pub track_index: i64,
     pub track_name: String,
     pub instrument_name: String,
-    pub stream_url: String,
+    pub chunk_url_template: String,
+    pub chunk_count: i64,
+    pub chunk_duration_seconds: f64,
+    pub duration_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +81,7 @@ pub struct AdminMusicResponse {
     pub public_id_url: Option<String>,
     pub download_url: String,
     pub midi_download_url: Option<String>,
+    pub quality_profile: String,
     pub created_at: String,
     pub stems_total_bytes: i64,
 }
