@@ -47,6 +47,9 @@ $env:S3_REGION="eu-west-3"
 $env:S3_ENDPOINT="http://127.0.0.1:9000"
 $env:S3_FORCE_PATH_STYLE="true"
 $env:MUSESCORE_BIN="C:\Program Files\MuseScore Studio 4\bin\MuseScoreStudio.exe"
+$env:MUSESCORE_DOCKER_IMAGE="your-musescore-cli-image"
+$env:DOCKER_BIN="docker"
+$env:MUSESCORE_QT_PLATFORM="offscreen"
 ```
 
 If `S3_BUCKET`, `S3_ACCESS_KEY_ID`, and `S3_SECRET_ACCESS_KEY` are all unset, the backend stores uploaded files under `LOCAL_STORAGE_PATH`.
@@ -60,7 +63,20 @@ browser will fetch MIDI, MusicXML, or stem audio directly.
 schema management, and `DATABASE_URL_READ_ONLY` is used for public read traffic. If the admin or
 read-only URLs are unset, the backend falls back to `DATABASE_URL`.
 
-`MUSESCORE_BIN` enables derivative exports. Browsers cannot natively play `.mscz`, so the backend tries to export:
+`MUSESCORE_BIN` enables derivative exports from a native MuseScore install. If it is unset, the
+backend also probes common MuseScore locations on Windows, macOS, Linux, and the current `PATH`.
+
+If you prefer containerized conversion, set `MUSESCORE_DOCKER_IMAGE` instead. When it is set, the
+backend runs `docker run --rm` with bind mounts for the score input/output directories and expects
+the container image entrypoint to behave like the MuseScore CLI. `DOCKER_BIN` overrides the Docker
+executable path when `docker` is not the right command name.
+
+On Linux, the backend defaults native MuseScore launches to `QT_QPA_PLATFORM=offscreen` for
+headless export. On Windows and macOS it does not force a Qt platform plugin, which avoids the
+"no Qt platform plugin could be initialized" failure from native Windows installs. Set
+`MUSESCORE_QT_PLATFORM` only when you need to override that default explicitly.
+
+Derivative exports are optional. When MuseScore is available, the backend tries to export:
 
 - MP3 for direct browser playback
 - MIDI for browser-side playback and per-instrument frontend mixing

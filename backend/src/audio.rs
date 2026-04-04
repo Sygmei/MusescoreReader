@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
@@ -1307,18 +1308,159 @@ async fn find_musescore_binary(config: &AppConfig) -> Option<String> {
     ];
 
     for candidate in candidates {
-        if Command::new(candidate)
-            .arg("--long-version")
-            .output()
-            .await
-            .map(|output| output.status.success())
-            .unwrap_or(false)
-        {
+        if probe_musescore_binary(candidate).await {
             return Some(candidate.to_owned());
         }
     }
 
+    for candidate in platform_musescore_binary_candidates() {
+        if probe_musescore_binary(&candidate).await {
+            return Some(candidate);
+        }
+    }
+
     None
+}
+
+#[derive(Clone, Debug)]
+enum MuseScoreCommand {
+    Native { binary: String },
+    Docker { image: String },
+}
+
+async fn probe_musescore_binary(binary: &str) -> bool {
+    Command::new(binary)
+        .arg("--long-version")
+        .output()
+        .await
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_musescore_binary_candidates() -> Vec<String> {
+    vec![
+        r"C:\Program Files\MuseScore Studio 4\bin\MuseScoreStudio.exe".to_owned(),
+        r"C:\Program Files\MuseScore 4\bin\MuseScore4.exe".to_owned(),
+        r"C:\Program Files\MuseScore 3\bin\MuseScore3.exe".to_owned(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn platform_musescore_binary_candidates() -> Vec<String> {
+    vec![
+        "/Applications/MuseScore Studio 4.app/Contents/MacOS/mscore".to_owned(),
+        "/Applications/MuseScore 4.app/Contents/MacOS/mscore".to_owned(),
+        "/Applications/MuseScore 3.app/Contents/MacOS/mscore".to_owned(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn platform_musescore_binary_candidates() -> Vec<String> {
+    vec![
+        "/usr/local/bin/musescore4".to_owned(),
+        "/usr/local/bin/musescore".to_owned(),
+        "/usr/bin/musescore4".to_owned(),
+        "/usr/bin/musescore".to_owned(),
+        "/usr/bin/mscore".to_owned(),
+        "/opt/musescore4/AppRun".to_owned(),
+    ]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn platform_musescore_binary_candidates() -> Vec<String> {
+    Vec::new()
+}
+
+async fn find_musescore_command(config: &AppConfig) -> Option<MuseScoreCommand> {
+    if let Some(image) = &config.musescore_docker_image {
+        return Some(MuseScoreCommand::Docker {
+            image: image.clone(),
+        });
+    }
+
+    find_musescore_binary(config)
+        .await
+        .map(|binary| MuseScoreCommand::Native { binary })
+}
+
+fn native_musescore_command(binary: &str, config: &AppConfig, xdg_runtime_dir: &Path) -> Command {
+    let mut command = Command::new(binary);
+
+    #[cfg(target_os = "linux")]
+    {
+        command
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("XDG_RUNTIME_DIR", xdg_runtime_dir);
+
+        let qt_qpa_platform = config
+            .musescore_qt_platform
+            .clone()
+            .unwrap_or_else(|| "offscreen".to_owned());
+        command.env("QT_QPA_PLATFORM", qt_qpa_platform);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = xdg_runtime_dir;
+        if let Some(qt_qpa_platform) = &config.musescore_qt_platform {
+            command.env("QT_QPA_PLATFORM", qt_qpa_platform);
+        } else {
+            command.env_remove("QT_QPA_PLATFORM");
+        }
+    }
+
+    command
+}
+
+fn docker_musescore_command(
+    config: &AppConfig,
+    image: &str,
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<Command> {
+    let input_dir = input_path
+        .parent()
+        .context("MuseScore input path has no parent directory")?
+        .canonicalize()
+        .with_context(|| format!("failed to resolve input directory {}", input_path.display()))?;
+    let output_dir = output_path
+        .parent()
+        .context("MuseScore output path has no parent directory")?
+        .canonicalize()
+        .with_context(|| format!("failed to resolve output directory {}", output_path.display()))?;
+
+    let input_file_name = file_name(input_path)?;
+    let output_file_name = file_name(output_path)?;
+
+    let mut command = Command::new(&config.docker_bin);
+    command
+        .arg("run")
+        .arg("--rm")
+        .arg("--mount")
+        .arg(bind_mount_arg(&input_dir, "/work/input", true))
+        .arg("--mount")
+        .arg(bind_mount_arg(&output_dir, "/work/output", false))
+        .arg(image)
+        .arg("-o")
+        .arg(format!("/work/output/{output_file_name}"))
+        .arg(format!("/work/input/{input_file_name}"));
+    Ok(command)
+}
+
+fn bind_mount_arg(source: &Path, target: &str, readonly: bool) -> String {
+    let mut arg = format!("type=bind,source={},target={target}", source.display());
+    if readonly {
+        arg.push_str(",readonly");
+    }
+    arg
+}
+
+fn file_name(path: &Path) -> Result<&str> {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .with_context(|| format!("path '{}' has no valid UTF-8 file name", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1333,7 +1475,7 @@ async fn convert_with_musescore(
     extension: &'static str,
     unavailable_reason: &str,
 ) -> Result<ConversionOutcome> {
-    let Some(binary) = find_musescore_binary(config).await else {
+    let Some(command_kind) = find_musescore_command(config).await else {
         return Ok(ConversionOutcome::Unavailable {
             reason: unavailable_reason.to_owned(),
         });
@@ -1350,17 +1492,22 @@ async fn convert_with_musescore(
         .await
         .with_context(|| format!("failed to create {}", xdg_runtime_dir.display()))?;
 
-    let command_output = Command::new(&binary)
-        .env("QT_QPA_PLATFORM", "offscreen")
-        .env("LANG", "C.UTF-8")
-        .env("LC_ALL", "C.UTF-8")
-        .env("XDG_RUNTIME_DIR", &xdg_runtime_dir)
-        .arg("-o")
-        .arg(output_path)
-        .arg(input_path)
+    let (runner_label, mut command) = match &command_kind {
+        MuseScoreCommand::Native { binary } => {
+            let mut command = native_musescore_command(binary, config, &xdg_runtime_dir);
+            command.arg("-o").arg(output_path).arg(input_path);
+            (binary.as_str().to_owned(), command)
+        }
+        MuseScoreCommand::Docker { image } => (
+            format!("{} run {}", config.docker_bin, image),
+            docker_musescore_command(config, image, input_path, output_path)?,
+        ),
+    };
+
+    let command_output = command
         .output()
         .await
-        .with_context(|| format!("failed to start MuseScore converter '{binary}'"))?;
+        .with_context(|| format!("failed to start MuseScore converter '{runner_label}'"))?;
 
     if !command_output.status.success() {
         let stderr = sanitize_musescore_output(String::from_utf8_lossy(&command_output.stderr).as_ref());
@@ -1379,9 +1526,9 @@ async fn convert_with_musescore(
 
         return Ok(ConversionOutcome::Failed {
             reason: if detail.is_empty() {
-                format!("MuseScore converter '{binary}' failed with {status}.")
+                format!("MuseScore converter '{runner_label}' failed with {status}.")
             } else {
-                format!("MuseScore converter '{binary}' failed with {status}.\n{detail}")
+                format!("MuseScore converter '{runner_label}' failed with {status}.\n{detail}")
             },
         });
     }

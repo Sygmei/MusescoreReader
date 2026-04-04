@@ -11,6 +11,9 @@ pub struct AppConfig {
     pub database_url_read_only: String,
     pub storage: StorageConfig,
     pub musescore_bin: Option<String>,
+    pub musescore_docker_image: Option<String>,
+    pub musescore_qt_platform: Option<String>,
+    pub docker_bin: String,
     pub soundfont_dir: Option<PathBuf>,
     pub sfizz_bin: Option<String>,
     pub fluidsynth_bin: Option<String>,
@@ -89,6 +92,19 @@ impl AppConfig {
             .ok()
             .filter(|value| !value.trim().is_empty());
 
+        let musescore_docker_image = env::var("MUSESCORE_DOCKER_IMAGE")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+
+        let musescore_qt_platform = env::var("MUSESCORE_QT_PLATFORM")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+
+        let docker_bin = env::var("DOCKER_BIN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "docker".to_owned());
+
         let soundfont_dir = env::var("SOUNDFONT_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -111,6 +127,9 @@ impl AppConfig {
             database_url_read_only,
             storage,
             musescore_bin,
+            musescore_docker_image,
+            musescore_qt_platform,
+            docker_bin,
             soundfont_dir,
             sfizz_bin,
             fluidsynth_bin,
