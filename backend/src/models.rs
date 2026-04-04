@@ -33,6 +33,18 @@ pub struct StemRecord {
     pub track_name: String,
     pub instrument_name: String,
     pub storage_key: String,
+    pub drum_map_json: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DrumMapEntry {
+    pub pitch: u8,
+    pub name: String,
+    pub head: Option<String>,
+    pub line: Option<i8>,
+    pub voice: Option<u8>,
+    pub stem: Option<i8>,
+    pub shortcut: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +69,7 @@ pub struct StemInfo {
     pub instrument_name: String,
     pub full_stem_url: String,
     pub duration_seconds: f64,
+    pub drum_map: Option<Vec<DrumMapEntry>>,
 }
 
 #[derive(Debug, Serialize)]

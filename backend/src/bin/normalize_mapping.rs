@@ -1,35 +1,38 @@
-//! normalize_mapping — measure the peak level of every SFZ instrument at MIDI
-//! velocity 80 (mezzo-forte) and write per-instrument gain corrections back
-//! into `mapping.json` under a `"gains"` key.
+//! normalize_mapping - generate a `gains.json` file from `mapping.json`.
 //!
 //! Usage (run from the workspace root or the backend directory):
 //!
-//!   cargo run --bin normalize_mapping [path/to/mapping.json] [output/samples/dir]
+//!   cargo run --bin normalize_mapping [--auto] [path/to/mapping.json] [output/samples/dir]
 //!
 //! If no mapping path is given it tries `../soundfonts/mapping.json`.
-//! If an output directory is given, raw WAVs are copied there and a second
-//! set of gain-corrected WAVs is written alongside them for listening comparison.
+//!
+//! Default mode writes a zero-gain template for every semantic gain alias
+//! referenced by the mapping, such as `percussion`, `fallback`, `42`,
+//! `42.staccato`, and `42.override.45`.
+//!
+//! `--auto` measures every mapped SFZ instrument at MIDI velocity 80
+//! (mezzo-forte), computes peak-based gain corrections, and writes those values
+//! into the same `gains.json` template. SF2 entries remain at 0 dB.
+//!
+//! If an output directory is given in `--auto` mode, raw WAVs are copied there
+//! and a second set of gain-corrected WAVs is written alongside them for
+//! listening comparison.
 //!
 //! The test note is chosen from the middle of each instrument's own SFZ key
 //! range so that instruments like piccolo (which can't play C4) are measured
-//! correctly.  Percussive instruments (xylophone, marimba, …) are handled by
+//! correctly. Percussive instruments (xylophone, marimba, etc.) are handled by
 //! measuring peak amplitude rather than RMS, so their short attack is captured
 //! instead of being buried by the silent tail.
 //!
-//! Only SFZ files are measured; SF2 entries are skipped (gain = 0).
+//! Only SFZ files are measured automatically; SF2 entries always stay at 0 dB.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let mapping_path: PathBuf = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../soundfonts/mapping.json"));
-
-    // Optional second argument: directory to export labelled WAV samples to.
-    let export_dir: Option<PathBuf> = args.get(2).map(PathBuf::from);
+    let options = parse_args()?;
+    let mapping_path = options.mapping_path.clone();
+    let export_dir = options.export_dir.clone();
 
     let sfz_dir = mapping_path
         .parent()
@@ -38,115 +41,236 @@ fn main() -> anyhow::Result<()> {
 
     let mapping_text = std::fs::read_to_string(&mapping_path)
         .map_err(|e| anyhow::anyhow!("Cannot read {}: {e}", mapping_path.display()))?;
-
     let mapping: serde_json::Value = serde_json::from_str(&mapping_text)?;
+    let gain_aliases = collect_gain_aliases(&mapping);
 
-    // ------------------------------------------------------------------
-    // Collect every unique SFZ path referenced by the mapping.
-    // SF2 files are skipped — their internal GM normalisation is handled
-    // by FluidSynth.
-    // ------------------------------------------------------------------
-    let mut sfz_paths: HashSet<String> = HashSet::new();
+    if gain_aliases.is_empty() {
+        anyhow::bail!("No soundfont paths found in {}", mapping_path.display());
+    }
 
-    let add = |v: Option<&serde_json::Value>, set: &mut HashSet<String>| {
-        if let Some(s) = v.and_then(|v| v.as_str()) {
-            if !s.to_lowercase().ends_with(".sf2") {
-                set.insert(s.to_string());
-            }
+    let mut gains: BTreeMap<String, f64> =
+        gain_aliases.keys().cloned().map(|key| (key, 0.0)).collect();
+
+    println!(
+        "mapping      : {}",
+        mapping_path
+            .canonicalize()
+            .unwrap_or(mapping_path.clone())
+            .display()
+    );
+    println!("sfz dir      : {}", sfz_dir.display());
+    println!(
+        "mode         : {}",
+        if options.auto {
+            "auto peak normalization"
+        } else {
+            "zero-gain template"
         }
+    );
+    if let Some(dir) = &export_dir {
+        println!("export dir   : {}", dir.display());
+    }
+    println!("entries      : {}", gains.len());
+    println!();
+
+    if options.auto {
+        let sfizz = find_sfizz().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sfizz_render not found in PATH. \
+                 Install sfizz and ensure sfizz_render is on PATH (or set SFIZZ_BIN)."
+            )
+        })?;
+        let ffmpeg = find_binary(&["ffmpeg", "ffmpeg.exe"]);
+        println!("sfizz_render : {sfizz}");
+        if let Some(ffmpeg) = &ffmpeg {
+            println!("ffmpeg       : {ffmpeg}");
+        }
+        println!();
+
+        let adjustments = auto_measure_gains(
+            &gain_aliases,
+            &sfz_dir,
+            export_dir.as_deref(),
+            &sfizz,
+            ffmpeg.as_deref(),
+        )?;
+        for (key, gain) in adjustments {
+            gains.insert(key, gain);
+        }
+    } else if export_dir.is_some() {
+        println!("Note: export dir is ignored unless --auto is used.");
+        println!();
+    }
+
+    let gains_path = sfz_dir.join("gains.json");
+    let out = serde_json::to_string_pretty(&gains)?;
+    std::fs::write(&gains_path, out)?;
+
+    println!(
+        "Wrote {} gain entries to {}",
+        gains.len(),
+        gains_path.display()
+    );
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CliOptions {
+    auto: bool,
+    mapping_path: PathBuf,
+    export_dir: Option<PathBuf>,
+}
+
+fn parse_args() -> anyhow::Result<CliOptions> {
+    let mut auto = false;
+    let mut positional: Vec<String> = Vec::new();
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--auto" => auto = true,
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            _ if arg.starts_with('-') => {
+                anyhow::bail!("Unknown flag: {arg}\n\n{}", usage_text());
+            }
+            _ => positional.push(arg),
+        }
+    }
+
+    if positional.len() > 2 {
+        anyhow::bail!("Too many positional arguments.\n\n{}", usage_text());
+    }
+
+    Ok(CliOptions {
+        auto,
+        mapping_path: positional
+            .first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("../soundfonts/mapping.json")),
+        export_dir: positional.get(1).map(PathBuf::from),
+    })
+}
+
+fn usage_text() -> &'static str {
+    "Usage: cargo run --bin normalize_mapping [--auto] [path/to/mapping.json] [output/samples/dir]"
+}
+
+fn print_usage() {
+    println!("{}", usage_text());
+    println!();
+    println!("Default mode writes a zero-gain gains.json template from mapping.json.");
+    println!("--auto measures mapped SFZ files and fills in calculated gain values.");
+}
+
+fn collect_gain_aliases(mapping: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
+
+    let add_alias = |alias: String, source: &str, aliases: &mut BTreeMap<String, String>| {
+        aliases.entry(alias).or_insert_with(|| source.to_owned());
     };
 
-    add(mapping.get("percussion"), &mut sfz_paths);
-    add(mapping.get("fallback"), &mut sfz_paths);
-    // Programs entries can be a plain string or a detail object with
-    // "sfz", "staccato", "vibrato", and "overrides" fields.
+    if let Some(source) = mapping.get("percussion").and_then(|v| v.as_str()) {
+        add_alias("percussion".to_owned(), source, &mut aliases);
+    }
+
+    if let Some(source) = mapping.get("fallback").and_then(|v| v.as_str()) {
+        add_alias("fallback".to_owned(), source, &mut aliases);
+    }
+
     if let Some(programs) = mapping.get("programs").and_then(|v| v.as_object()) {
-        for val in programs.values() {
-            if val.is_string() {
-                add(Some(val), &mut sfz_paths);
-            } else if let Some(obj) = val.as_object() {
-                add(obj.get("sfz"), &mut sfz_paths);
-                add(obj.get("staccato"), &mut sfz_paths);
-                add(obj.get("vibrato"), &mut sfz_paths);
-                if let Some(overrides) = obj.get("overrides").and_then(|v| v.as_object()) {
-                    for sfz_val in overrides.values() {
-                        add(Some(sfz_val), &mut sfz_paths);
+        for (program, value) in programs {
+            if let Some(source) = value.as_str() {
+                add_alias(program.clone(), source, &mut aliases);
+                continue;
+            }
+
+            let Some(obj) = value.as_object() else {
+                continue;
+            };
+
+            if let Some(source) = obj.get("sfz").and_then(|v| v.as_str()) {
+                add_alias(program.clone(), source, &mut aliases);
+            }
+            if let Some(source) = obj.get("staccato").and_then(|v| v.as_str()) {
+                add_alias(format!("{program}.staccato"), source, &mut aliases);
+            }
+            if let Some(source) = obj.get("vibrato").and_then(|v| v.as_str()) {
+                add_alias(format!("{program}.vibrato"), source, &mut aliases);
+            }
+            if let Some(overrides) = obj.get("overrides").and_then(|v| v.as_object()) {
+                for (override_program, sfz_value) in overrides {
+                    if let Some(source) = sfz_value.as_str() {
+                        add_alias(
+                            format!("{program}.override.{override_program}"),
+                            source,
+                            &mut aliases,
+                        );
                     }
                 }
             }
         }
     }
 
-    // ------------------------------------------------------------------
-    // Locate sfizz_render — honour SFIZZ_BIN env var first, then PATH
-    // ------------------------------------------------------------------
-    let sfizz = find_sfizz().ok_or_else(|| {
-        anyhow::anyhow!(
-            "sfizz_render not found in PATH. \
-             Install sfizz and ensure sfizz_render is on PATH (or set SFIZZ_BIN)."
-        )
-    })?;
+    aliases
+}
 
-    // Locate ffmpeg (needed only for corrected export; not fatal if absent).
-    let ffmpeg = find_binary(&["ffmpeg", "ffmpeg.exe"]);
+fn normalize_mapping_key(path: &str) -> String {
+    path.replace('\\', "/")
+}
 
-    println!("sfizz_render : {sfizz}");
-    println!(
-        "mapping      : {}",
-        mapping_path.canonicalize().unwrap_or(mapping_path.clone()).display()
-    );
-    println!("sfz dir      : {}", sfz_dir.display());
-    if let Some(dir) = &export_dir {
-        println!("export dir   : {}", dir.display());
+fn auto_measure_gains(
+    gain_aliases: &BTreeMap<String, String>,
+    sfz_dir: &Path,
+    export_dir: Option<&Path>,
+    sfizz: &str,
+    ffmpeg: Option<&str>,
+) -> anyhow::Result<BTreeMap<String, f64>> {
+    let mut measured_sources = BTreeMap::new();
+    for source in gain_aliases.values() {
+        if source.to_ascii_lowercase().ends_with(".sfz") {
+            measured_sources
+                .entry(normalize_mapping_key(source))
+                .or_insert_with(|| source.clone());
+        }
     }
-    println!();
 
-    // ------------------------------------------------------------------
-    // Prepare a shared test MIDI file (C4, vel=80, 3 s, prog 0)
-    // ------------------------------------------------------------------
+    if measured_sources.is_empty() {
+        anyhow::bail!("No SFZ entries found in mapping.json for --auto mode.");
+    }
+
     let tmp = std::env::temp_dir().join("normalize_mapping");
     std::fs::create_dir_all(&tmp)?;
-    println!("Working directory: {}", tmp.display());
-    println!();
-
-    // ------------------------------------------------------------------
-    // Render each SFZ and measure its peak level
-    // ------------------------------------------------------------------
-    let mut level_db: HashMap<String, f64> = HashMap::new();
-    // Maps rel path → temp WAV path (for the corrected-export pass later)
-    let mut wav_by_rel: HashMap<String, PathBuf> = HashMap::new();
-    let mut sorted_paths: Vec<String> = sfz_paths.into_iter().collect();
-    sorted_paths.sort();
-
-    if let Some(dir) = &export_dir {
+    if let Some(dir) = export_dir {
         std::fs::create_dir_all(dir)?;
     }
 
-    println!("Measuring {} SFZ instrument(s)…", sorted_paths.len());
+    println!("Working directory: {}", tmp.display());
+    println!();
+    println!("Measuring {} SFZ instrument(s)...", measured_sources.len());
     println!("{:-<60}", "");
 
-    for rel in &sorted_paths {
-        let sfz_path = sfz_dir.join(rel);
+    let mut level_db: HashMap<String, f64> = HashMap::new();
+    let mut wav_by_source_key: HashMap<String, PathBuf> = HashMap::new();
+
+    for (source_key, source) in &measured_sources {
+        let sfz_path = sfz_dir.join(source);
         if !sfz_path.exists() {
-            println!("  SKIP   {rel}  (file not found)");
+            println!("  SKIP   {}  (file not found)", source);
             continue;
         }
 
-        // Pick a note in this instrument's own SFZ key range.
         let (lo, hi) = sfz_key_range(&sfz_path).unwrap_or((60, 60));
-        let note = (lo as u16 + hi as u16) / 2;  // midpoint, safe from overflow
-        let note = note.min(127) as u8;
+        let note = ((lo as u16 + hi as u16) / 2).min(127) as u8;
 
-        // Build a safe filename, per-instrument MIDI and temp WAV path.
-        let safe: String = rel
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' })
-            .collect();
+        let safe = safe_filename(source_key);
         let midi_path = tmp.join(format!("{safe}.mid"));
         write_test_midi(&midi_path, note)?;
         let wav_path = tmp.join(format!("{safe}.wav"));
 
-        let result = std::process::Command::new(&sfizz)
+        let result = std::process::Command::new(sfizz)
             .arg("--sfz")
             .arg(&sfz_path)
             .arg("--midi")
@@ -162,11 +286,11 @@ fn main() -> anyhow::Result<()> {
             Ok(o) => {
                 let msg = String::from_utf8_lossy(&o.stderr);
                 let first = msg.trim().lines().next().unwrap_or("unknown error");
-                println!("  FAIL   {rel}  — {first}");
+                println!("  FAIL   {}  - {first}", source);
                 continue;
             }
             Err(e) => {
-                println!("  FAIL   {rel}  — spawn error: {e}");
+                println!("  FAIL   {}  - spawn error: {e}", source);
                 continue;
             }
         }
@@ -174,20 +298,22 @@ fn main() -> anyhow::Result<()> {
         match measure_peak(&wav_path) {
             Ok(peak) if peak > 1e-5 => {
                 let db = 20.0 * peak.log10();
-                println!("  {:+7.2} dBFS  note={note:3}  {rel}", db);
-                level_db.insert(rel.clone(), db);
-                wav_by_rel.insert(rel.clone(), wav_path.clone());
+                println!("  {:+7.2} dBFS  note={note:3}  {}", db, source);
+                level_db.insert(source_key.clone(), db);
+                wav_by_source_key.insert(source_key.clone(), wav_path.clone());
 
-                // Copy raw WAV to export dir immediately
-                if let Some(dir) = &export_dir {
+                if let Some(dir) = export_dir {
                     let dest = dir.join(format!("raw_{safe}.wav"));
                     let _ = std::fs::copy(&wav_path, &dest);
                 }
             }
-            Ok(_) => println!(
-                "  SILENT {rel}  note={note:3}  (no output — wrong range? file corrupt?)"
-            ),
-            Err(e) => println!("  ERR    {rel}  — {e}"),
+            Ok(_) => {
+                println!(
+                    "  SILENT {}  note={note:3}  (no output - wrong range? file corrupt?)",
+                    source
+                );
+            }
+            Err(e) => println!("  ERR    {}  - {e}", source),
         }
     }
 
@@ -195,10 +321,6 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("No instruments could be measured. Check sfizz_render and your SFZ files.");
     }
 
-    // ------------------------------------------------------------------
-    // Compute target level = median of all measured levels, then gain
-    // correction for each instrument.
-    // ------------------------------------------------------------------
     let mut levels: Vec<f64> = level_db.values().cloned().collect();
     levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let target_db = levels[levels.len() / 2];
@@ -209,48 +331,43 @@ fn main() -> anyhow::Result<()> {
     println!("Gain corrections:");
     println!("{:-<60}", "");
 
-    let mut gains_obj = serde_json::Map::new();
-    let mut adjustments: Vec<(String, f64)> = level_db
+    let gain_by_source_key: BTreeMap<String, f64> = level_db
         .iter()
-        .map(|(k, v)| (k.clone(), target_db - v))
+        .map(|(source_key, level)| {
+            let rounded = ((target_db - level) * 10.0).round() / 10.0;
+            (source_key.clone(), rounded)
+        })
         .collect();
-    adjustments.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // loudest cut first
 
-    for (rel, gain) in &adjustments {
-        println!("  {:+6.1} dB  {rel}", gain);
-        let rounded = (gain * 10.0).round() / 10.0; // 1 decimal place
-        gains_obj.insert(rel.clone(), serde_json::json!(rounded));
+    let mut measured_gains = BTreeMap::new();
+    let mut alias_adjustments: Vec<(String, f64)> = gain_aliases
+        .iter()
+        .filter_map(|(alias, source)| {
+            let source_key = normalize_mapping_key(source);
+            gain_by_source_key
+                .get(&source_key)
+                .copied()
+                .map(|gain| (alias.clone(), gain))
+        })
+        .collect();
+    alias_adjustments.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (alias, gain) in &alias_adjustments {
+        println!("  {:+6.1} dB  {alias}", gain);
+        measured_gains.insert(alias.clone(), *gain);
     }
 
-    // ------------------------------------------------------------------
-    // Write gains to gains.json (sibling of mapping.json)
-    // ------------------------------------------------------------------
-    let gains_path = sfz_dir.join("gains.json");
-    let out = serde_json::to_string_pretty(&serde_json::Value::Object(gains_obj))?;
-    std::fs::write(&gains_path, out)?;
-
-    println!();
-    println!(
-        "Wrote {} gain entries to {}",
-        adjustments.len(),
-        gains_path.display()
-    );
-
-    // ------------------------------------------------------------------
-    // Export gain-corrected WAVs so you can listen and verify
-    // ------------------------------------------------------------------
-    if let Some(dir) = &export_dir {
-        if let Some(ff) = &ffmpeg {
+    if let Some(dir) = export_dir {
+        if let Some(ffmpeg) = ffmpeg {
             println!();
-            println!("Writing gain-corrected WAVs to {} …", dir.display());
-            for (rel, gain) in &adjustments {
-                let Some(src_wav) = wav_by_rel.get(rel) else { continue };
-                let safe: String = rel
-                    .chars()
-                    .map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' })
-                    .collect();
+            println!("Writing gain-corrected WAVs to {} ...", dir.display());
+            for (source_key, gain) in &gain_by_source_key {
+                let Some(src_wav) = wav_by_source_key.get(source_key) else {
+                    continue;
+                };
+                let safe = safe_filename(source_key);
                 let dest = dir.join(format!("corrected_{safe}.wav"));
-                let mut cmd = std::process::Command::new(ff);
+                let mut cmd = std::process::Command::new(ffmpeg);
                 cmd.arg("-y").arg("-i").arg(src_wav);
                 if gain.abs() > 0.05 {
                     cmd.arg("-af").arg(format!("volume={:.2}dB", gain));
@@ -263,22 +380,34 @@ fn main() -> anyhow::Result<()> {
                     Ok(o) => {
                         let msg = String::from_utf8_lossy(&o.stderr);
                         let first = msg.trim().lines().next().unwrap_or("?");
-                        println!("  ERR corrected_{safe}.wav  — {first}");
+                        println!("  ERR corrected_{safe}.wav  - {first}");
                     }
-                    Err(e) => println!("  ERR corrected_{safe}.wav  — {e}"),
+                    Err(e) => println!("  ERR corrected_{safe}.wav  - {e}"),
                 }
             }
         } else {
             println!();
             println!(
-                "Note: ffmpeg not found — skipping gain-corrected export. \
-                 Raw WAVs are in {}",
+                "Note: ffmpeg not found - skipping gain-corrected export. Raw WAVs are in {}",
                 dir.display()
             );
         }
     }
 
-    Ok(())
+    Ok(measured_gains)
+}
+
+fn safe_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -293,30 +422,23 @@ fn main() -> anyhow::Result<()> {
 fn write_test_midi(path: &Path, note: u8) -> anyhow::Result<()> {
     #[rustfmt::skip]
     let bytes: Vec<u8> = vec![
-        // MThd
         0x4D, 0x54, 0x68, 0x64,
-        0x00, 0x00, 0x00, 0x06, // chunk length = 6
-        0x00, 0x01,             // format 1
-        0x00, 0x02,             // 2 tracks
-        0x01, 0xE0,             // 480 ticks / quarter-note
+        0x00, 0x00, 0x00, 0x06,
+        0x00, 0x01,
+        0x00, 0x02,
+        0x01, 0xE0,
 
-        // MTrk 0 — tempo track (11 bytes)
         0x4D, 0x54, 0x72, 0x6B,
-        0x00, 0x00, 0x00, 0x0B, // chunk length = 11
-        0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20, // Δ=0  set tempo 500000 µs (120 BPM)
-        0x00, 0xFF, 0x2F, 0x00,                    // Δ=0  end of track
+        0x00, 0x00, 0x00, 0x0B,
+        0x00, 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20,
+        0x00, 0xFF, 0x2F, 0x00,
 
-        // MTrk 1 — note track (16 bytes)
-        // Δ=0    program change ch0 → prog 0
-        // Δ=0    note on  ch0  `note` vel 80
-        // Δ=2880 note off ch0  `note` vel 0
-        // Δ=0    end of track
         0x4D, 0x54, 0x72, 0x6B,
-        0x00, 0x00, 0x00, 0x10, // chunk length = 16
-        0x00, 0xC0, 0x00,       // program change → prog 0
-        0x00, 0x90, note, 0x50, // note on
-        0x96, 0x40, 0x80, note, 0x00, // note off (after 2880 ticks)
-        0x00, 0xFF, 0x2F, 0x00, // end of track
+        0x00, 0x00, 0x00, 0x10,
+        0x00, 0xC0, 0x00,
+        0x00, 0x90, note, 0x50,
+        0x96, 0x40, 0x80, note, 0x00,
+        0x00, 0xFF, 0x2F, 0x00,
     ];
 
     std::fs::write(path, &bytes)?;
@@ -328,10 +450,9 @@ fn write_test_midi(path: &Path, note: u8) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Parse a WAV file and return the peak amplitude (max |sample|) over the
-/// entire signal.  This correctly handles percussive instruments (xylophone,
-/// marimba, …) whose energy is concentrated in a brief attack; using the
-/// middle-60% RMS window would report near-silence for such instruments.
-/// Supports 16-bit PCM, 24-bit PCM, and 32-bit IEEE-float WAVs.
+/// entire signal. This correctly handles percussive instruments whose energy
+/// is concentrated in a brief attack. Supports 16-bit PCM, 24-bit PCM, and
+/// 32-bit IEEE-float WAVs.
 fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
     let data = std::fs::read(wav_path)?;
 
@@ -348,20 +469,13 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
     let mut data_offset: usize = 0;
     let mut data_size: usize = 0;
 
-    // Walk RIFF chunks
     while pos + 8 <= data.len() {
         let id = &data[pos..pos + 4];
-        let size =
-            u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
         let cstart = pos + 8;
 
         if id == b"fmt " && size >= 16 {
-            audio_format =
-                u16::from_le_bytes(data[cstart..cstart + 2].try_into().unwrap());
-            // channels at cstart+2
-            // sample_rate at cstart+4
-            // byte_rate at cstart+8
-            // block_align at cstart+12
+            audio_format = u16::from_le_bytes(data[cstart..cstart + 2].try_into().unwrap());
             bits_per_sample =
                 u16::from_le_bytes(data[cstart + 14..cstart + 16].try_into().unwrap());
         } else if id == b"data" {
@@ -370,7 +484,6 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
             break;
         }
 
-        // RIFF chunks are always word-aligned (pad byte if size is odd)
         pos = cstart + size + (size & 1);
     }
 
@@ -380,7 +493,6 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
 
     let raw = &data[data_offset..(data_offset + data_size).min(data.len())];
 
-    // Convert all samples to f64 in [-1.0, 1.0]
     let samples: Vec<f64> = match (audio_format, bits_per_sample) {
         (1, 16) => raw
             .chunks_exact(2)
@@ -390,7 +502,6 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
             .chunks_exact(3)
             .map(|b| {
                 let raw_i = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
-                // sign-extend 24-bit two's complement
                 let v = if raw_i & 0x80_0000 != 0 {
                     raw_i | !0xFF_FFFF
                 } else {
@@ -403,17 +514,13 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
             .collect(),
-        _ => anyhow::bail!(
-            "unsupported WAV format {audio_format} / {bits_per_sample}-bit"
-        ),
+        _ => anyhow::bail!("unsupported WAV format {audio_format} / {bits_per_sample}-bit"),
     };
 
     if samples.is_empty() {
         return Ok(0.0);
     }
 
-    // Peak amplitude over the entire signal — works for both sustained
-    // instruments and percussive ones whose energy lives in a brief attack.
     let peak = samples.iter().map(|&s| s.abs()).fold(0.0f64, f64::max);
     Ok(peak)
 }
@@ -422,9 +529,7 @@ fn measure_peak(wav_path: &Path) -> anyhow::Result<f64> {
 // Utility
 // ---------------------------------------------------------------------------
 
-/// Locate sfizz_render: honour SFIZZ_BIN env var first, then probe PATH.
-/// Mirrors the logic in `audio.rs` — only requires the process to spawn
-/// successfully (exit code is irrelevant; sfizz_render --help exits non-zero).
+/// Locate sfizz_render: honor SFIZZ_BIN env var first, then probe PATH.
 fn find_sfizz() -> Option<String> {
     if let Ok(path) = std::env::var("SFIZZ_BIN") {
         let p = path.trim().to_owned();
@@ -463,11 +568,8 @@ fn find_binary(candidates: &[&str]) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Scan an SFZ file for `lokey`, `hikey`, and `key` opcodes and return the
-/// overall `(lo, hi)` MIDI note range.  Returns `None` if no key opcodes are
+/// overall `(lo, hi)` MIDI note range. Returns `None` if no key opcodes are
 /// found (caller falls back to C4 = 60).
-///
-/// Handles both numeric values (`lokey=60`) and note names (`lokey=c4`,
-/// `lokey=d#5`, `lokey=eb3`).
 fn sfz_key_range(sfz_path: &Path) -> Option<(u8, u8)> {
     let text = std::fs::read_to_string(sfz_path).ok()?;
     let mut lo: u8 = 127;
@@ -475,30 +577,38 @@ fn sfz_key_range(sfz_path: &Path) -> Option<(u8, u8)> {
     let mut found = false;
 
     for line in text.lines() {
-        // Strip line comments
         let line = match line.find("//") {
             Some(i) => &line[..i],
             None => line,
         };
-        // Each opcode is a `key=value` token; split on whitespace
         for token in line.split_whitespace() {
-            let Some((k, v)) = token.split_once('=') else { continue };
+            let Some((k, v)) = token.split_once('=') else {
+                continue;
+            };
             let midi = match note_to_midi(v.trim()) {
                 Some(n) => n,
                 None => continue,
             };
             match k.trim().to_ascii_lowercase().as_str() {
-                "lokey" => { lo = lo.min(midi); found = true; }
-                "hikey" => { hi = hi.max(midi); found = true; }
-                // `key=N` is shorthand for `lokey=N hikey=N`
-                "key"   => { lo = lo.min(midi); hi = hi.max(midi); found = true; }
+                "lokey" => {
+                    lo = lo.min(midi);
+                    found = true;
+                }
+                "hikey" => {
+                    hi = hi.max(midi);
+                    found = true;
+                }
+                "key" => {
+                    lo = lo.min(midi);
+                    hi = hi.max(midi);
+                    found = true;
+                }
                 _ => {}
             }
         }
     }
 
     if found {
-        // If only lokey was ever set, hi stays 0 < lo — swap so range is valid.
         let (a, b) = (lo.min(hi), lo.max(hi));
         Some((a, b))
     } else {
@@ -507,10 +617,7 @@ fn sfz_key_range(sfz_path: &Path) -> Option<(u8, u8)> {
 }
 
 /// Convert an SFZ note value to a MIDI note number.
-/// Accepts integers ("60") and note names ("c4", "d#5", "eb3", "C-1").
-/// In SFZ notation: C-1 = 0, C0 = 12, C4 = 60, C8 = 108.
 fn note_to_midi(s: &str) -> Option<u8> {
-    // Try plain integer first
     if let Ok(n) = s.parse::<u8>() {
         return Some(n);
     }
@@ -524,15 +631,73 @@ fn note_to_midi(s: &str) -> Option<u8> {
         'g' => 7,
         'a' => 9,
         'b' => 11,
-        _   => return None,
+        _ => return None,
     };
     let accidental: i32 = match chars.peek() {
-        Some('#') => { chars.next(); 1 }
-        Some('b') => { chars.next(); -1 }
+        Some('#') => {
+            chars.next();
+            1
+        }
+        Some('b') => {
+            chars.next();
+            -1
+        }
         _ => 0,
     };
     let octave_str: String = chars.collect();
     let octave: i32 = octave_str.parse().ok()?;
     let midi = (octave + 1) * 12 + base + accidental;
-    if (0..=127).contains(&midi) { Some(midi as u8) } else { None }
+    if (0..=127).contains(&midi) {
+        Some(midi as u8)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_gain_aliases, normalize_mapping_key};
+
+    #[test]
+    fn collects_semantic_gain_aliases() {
+        let mapping = serde_json::json!({
+            "fallback": "Soundfont.sf2",
+            "percussion": "Drums.sfz",
+            "programs": {
+                "40": {
+                    "sfz": "Strings/Main.sfz",
+                    "staccato": "Strings/Stac.sfz",
+                    "vibrato": "Strings/Vib.sfz",
+                    "overrides": {
+                        "45": "Strings/Pizz.sfz"
+                    }
+                },
+                "41": "Strings/Main.sfz"
+            }
+        });
+
+        let aliases = collect_gain_aliases(&mapping);
+        let keys: Vec<_> = aliases.keys().cloned().collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "40",
+                "40.override.45",
+                "40.staccato",
+                "40.vibrato",
+                "41",
+                "fallback",
+                "percussion"
+            ]
+        );
+    }
+
+    #[test]
+    fn normalizes_backslashes_in_gain_keys() {
+        assert_eq!(
+            normalize_mapping_key(r"data\VSCO-2-CE-1.1.0\CelloEnsPizz.sfz"),
+            "data/VSCO-2-CE-1.1.0/CelloEnsPizz.sfz"
+        );
+    }
 }

@@ -15,16 +15,19 @@ use axum::{
 use bytes::Bytes;
 use config::{AppConfig, StorageConfig};
 use models::{
-    AdminMusicResponse, LoginRequest, LoginResponse, MusicRecord, PublicMusicResponse,
-    StemInfo, StemRecord, UpdateMusicRequest,
+    AdminMusicResponse, LoginRequest, LoginResponse, MusicRecord, PublicMusicResponse, StemInfo,
+    StemRecord, UpdateMusicRequest,
 };
 use rand::{Rng, distr::Alphanumeric};
-use sqlx::{PgPool, postgres::{PgConnectOptions, PgPoolOptions}};
+use sqlx::{
+    PgPool,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use std::str::FromStr;
 use std::{net::SocketAddr, path::PathBuf};
 use storage::Storage;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -151,7 +154,10 @@ async fn main() -> Result<()> {
         .route("/public/{access_key}/midi", get(public_music_midi))
         .route("/public/{access_key}/musicxml", get(public_music_musicxml))
         .route("/public/{access_key}/stems", get(public_music_stems))
-        .route("/public/{access_key}/stems/{track_index}", get(public_music_stem_audio))
+        .route(
+            "/public/{access_key}/stems/{track_index}",
+            get(public_music_stem_audio),
+        )
         .route("/public/{access_key}/download", get(public_music_download))
         .with_state(state.clone());
 
@@ -235,7 +241,8 @@ async fn ensure_schema(db: &PgPool) -> Result<()> {
             track_name TEXT NOT NULL,
             instrument_name TEXT NOT NULL,
             storage_key TEXT NOT NULL,
-            size_bytes BIGINT NOT NULL DEFAULT 0
+            size_bytes BIGINT NOT NULL DEFAULT 0,
+            drum_map_json TEXT
         )
         "#,
     )
@@ -263,6 +270,7 @@ async fn ensure_schema(db: &PgPool) -> Result<()> {
     )
     .await?;
     ensure_stems_column(db, "size_bytes", "BIGINT NOT NULL DEFAULT 0").await?;
+    ensure_stems_column(db, "drum_map_json", "TEXT").await?;
 
     Ok(())
 }
@@ -316,7 +324,10 @@ async fn fetch_stems_total(db: &PgPool, music_id: &str) -> i64 {
     .unwrap_or(0)
 }
 
-async fn find_public_music_record(state: &AppState, access_key: &str) -> Result<Option<MusicRecord>, AppError> {
+async fn find_public_music_record(
+    state: &AppState,
+    access_key: &str,
+) -> Result<Option<MusicRecord>, AppError> {
     if let Some(record) = find_music_by_access_key(&state.db_ro, access_key).await? {
         return Ok(Some(record));
     }
@@ -324,8 +335,12 @@ async fn find_public_music_record(state: &AppState, access_key: &str) -> Result<
     Ok(find_music_by_access_key(&state.db_rw, access_key).await?)
 }
 
-async fn find_public_stems(db_primary: &PgPool, db_fallback: &PgPool, music_id: &str) -> Result<Vec<StemRecord>, AppError> {
-    let query = "SELECT id, music_id, track_index, track_name, instrument_name, storage_key \
+async fn find_public_stems(
+    db_primary: &PgPool,
+    db_fallback: &PgPool,
+    music_id: &str,
+) -> Result<Vec<StemRecord>, AppError> {
+    let query = "SELECT id, music_id, track_index, track_name, instrument_name, storage_key, drum_map_json \
          FROM stems WHERE music_id = $1 ORDER BY track_index";
 
     let stems = sqlx::query_as::<_, StemRecord>(query)
@@ -349,7 +364,7 @@ async fn find_public_stem(
     music_id: &str,
     track_index: i64,
 ) -> Result<Option<StemRecord>, AppError> {
-    let query = "SELECT id, music_id, track_index, track_name, instrument_name, storage_key \
+    let query = "SELECT id, music_id, track_index, track_name, instrument_name, storage_key, drum_map_json \
          FROM stems WHERE music_id = $1 AND track_index = $2";
 
     if let Some(stem) = sqlx::query_as::<_, StemRecord>(query)
@@ -390,8 +405,10 @@ async fn admin_list_musics(
     )
     .fetch_all(&state.db_rw)
     .await?;
-    let totals: std::collections::HashMap<String, i64> =
-        total_rows.into_iter().map(|r| (r.music_id, r.total_bytes)).collect();
+    let totals: std::collections::HashMap<String, i64> = total_rows
+        .into_iter()
+        .map(|r| (r.music_id, r.total_bytes))
+        .collect();
 
     let items = rows
         .into_iter()
@@ -477,13 +494,25 @@ async fn admin_upload_music(
     //                      • upload MusicXML
     //                      • upload stem assets
     let (midi_outcome, musicxml_outcome) = tokio::try_join!(
-        async { audio::generate_midi(&state.config, &temp_input_path, temp_dir.path()).await.map_err(AppError::from) },
-        async { audio::generate_musicxml(&state.config, &temp_input_path, temp_dir.path()).await.map_err(AppError::from) },
+        async {
+            audio::generate_midi(&state.config, &temp_input_path, temp_dir.path())
+                .await
+                .map_err(AppError::from)
+        },
+        async {
+            audio::generate_musicxml(&state.config, &temp_input_path, temp_dir.path())
+                .await
+                .map_err(AppError::from)
+        },
     )?;
 
-    let (stem_results, stems_status, stems_error) =
-        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path(), quality_profile)
-            .await?;
+    let (stem_results, stems_status, stems_error) = audio::generate_stems(
+        &state.config,
+        &temp_input_path,
+        temp_dir.path(),
+        quality_profile,
+    )
+    .await?;
 
     // Insert the musics row BEFORE running store_stems so the FK constraint is satisfied.
     // Conversion-result columns have DEFAULT values and will be updated below.
@@ -588,7 +617,8 @@ async fn admin_retry_render(
     let record = find_music_by_id(&state.db_rw, &id)
         .await?
         .ok_or_else(|| AppError::not_found("Music not found"))?;
-    let quality_profile = audio::StemQualityProfile::from_stored_or_default(&record.quality_profile);
+    let quality_profile =
+        audio::StemQualityProfile::from_stored_or_default(&record.quality_profile);
 
     // Fetch the original score bytes from storage.
     let (score_bytes, _) = state.storage.get_bytes(&record.object_key).await?;
@@ -600,8 +630,16 @@ async fn admin_retry_render(
 
     // Re-run MIDI and MusicXML exports in parallel.
     let (midi_outcome, musicxml_outcome) = tokio::try_join!(
-        async { audio::generate_midi(&state.config, &temp_input_path, temp_dir.path()).await.map_err(AppError::from) },
-        async { audio::generate_musicxml(&state.config, &temp_input_path, temp_dir.path()).await.map_err(AppError::from) },
+        async {
+            audio::generate_midi(&state.config, &temp_input_path, temp_dir.path())
+                .await
+                .map_err(AppError::from)
+        },
+        async {
+            audio::generate_musicxml(&state.config, &temp_input_path, temp_dir.path())
+                .await
+                .map_err(AppError::from)
+        },
     )?;
     let (midi_object_key, midi_status, midi_error) =
         store_conversion(&state, &id, "midi", midi_outcome).await?;
@@ -614,9 +652,13 @@ async fn admin_retry_render(
         .execute(&state.db_rw)
         .await?;
 
-    let (stem_results, stems_status, stems_error) =
-        audio::generate_stems(&state.config, &temp_input_path, temp_dir.path(), quality_profile)
-            .await?;
+    let (stem_results, stems_status, stems_error) = audio::generate_stems(
+        &state.config,
+        &temp_input_path,
+        temp_dir.path(),
+        quality_profile,
+    )
+    .await?;
 
     let (stems_status, stems_error) =
         store_stems(&state, &id, stem_results, stems_status, stems_error).await?;
@@ -663,14 +705,20 @@ async fn store_stems(
     for stem in stems {
         let size_bytes = stem.bytes.len() as i64;
         let storage_key = stem_full_key(music_id, stem.track_index);
+        let drum_map_json = stem
+            .drum_map
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| AppError::from(anyhow::Error::from(error)))?;
         state
             .storage
             .upload_bytes(&storage_key, stem.bytes.clone(), "audio/ogg")
             .await?;
 
         sqlx::query(
-            "INSERT INTO stems (music_id, track_index, track_name, instrument_name, storage_key, size_bytes) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO stems (music_id, track_index, track_name, instrument_name, storage_key, size_bytes, drum_map_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(music_id)
         .bind(stem.track_index as i64)
@@ -678,6 +726,7 @@ async fn store_stems(
         .bind(&stem.instrument_name)
         .bind(&storage_key)
         .bind(size_bytes)
+        .bind(&drum_map_json)
         .execute(&state.db_rw)
         .await?;
     }
@@ -727,15 +776,16 @@ async fn public_music_stems(
             .storage
             .public_url(&stem.storage_key)
             .unwrap_or_else(|| format!("/api/public/{}/stems/{}", access_key, stem.track_index));
-        let duration_seconds = if let Some(path) = state.storage.local_path_for_key(&stem.storage_key) {
-            probe_audio_duration_seconds(&path).await?
-        } else {
-            let (stem_bytes, _) = state.storage.get_bytes(&stem.storage_key).await?;
-            let temp_dir = tempfile::tempdir()?;
-            let full_stem_path = temp_dir.path().join("stem.ogg");
-            fs::write(&full_stem_path, stem_bytes).await?;
-            probe_audio_duration_seconds(&full_stem_path).await?
-        };
+        let duration_seconds =
+            if let Some(path) = state.storage.local_path_for_key(&stem.storage_key) {
+                probe_audio_duration_seconds(&path).await?
+            } else {
+                let (stem_bytes, _) = state.storage.get_bytes(&stem.storage_key).await?;
+                let temp_dir = tempfile::tempdir()?;
+                let full_stem_path = temp_dir.path().join("stem.ogg");
+                fs::write(&full_stem_path, stem_bytes).await?;
+                probe_audio_duration_seconds(&full_stem_path).await?
+            };
 
         resolved_infos.push(StemInfo {
             track_index: stem.track_index,
@@ -743,6 +793,12 @@ async fn public_music_stems(
             instrument_name: stem.instrument_name,
             full_stem_url,
             duration_seconds,
+            drum_map: stem
+                .drum_map_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| AppError::from(anyhow::Error::from(error)))?,
         });
     }
 
@@ -996,10 +1052,7 @@ async fn find_music_by_id(db: &PgPool, id: &str) -> Result<Option<MusicRecord>> 
     .await?)
 }
 
-async fn find_music_by_access_key(
-    db: &PgPool,
-    access_key: &str,
-) -> Result<Option<MusicRecord>> {
+async fn find_music_by_access_key(db: &PgPool, access_key: &str) -> Result<Option<MusicRecord>> {
     Ok(sqlx::query_as::<_, MusicRecord>(
         r#"
         SELECT id, title, filename, content_type, object_key, audio_object_key, audio_status, audio_error, midi_object_key, midi_status, midi_error, musicxml_object_key, musicxml_status, musicxml_error, stems_status, stems_error, public_token, public_id, quality_profile, created_at
@@ -1024,14 +1077,11 @@ fn record_to_admin_response(
         .public_id
         .as_ref()
         .map(|public_id| config.public_url_for(public_id));
-    let midi_download_url = record
-        .midi_object_key
-        .as_ref()
-        .map(|object_key| {
-            storage
-                .public_url(object_key)
-                .unwrap_or_else(|| format!("/api/public/{}/midi", record.public_token))
-        });
+    let midi_download_url = record.midi_object_key.as_ref().map(|object_key| {
+        storage
+            .public_url(object_key)
+            .unwrap_or_else(|| format!("/api/public/{}/midi", record.public_token))
+    });
     let download_url = storage
         .public_url(&record.object_key)
         .unwrap_or_else(|| format!("/api/public/{}/download", record.public_token));
@@ -1106,18 +1156,14 @@ fn generate_public_token() -> String {
         .collect()
 }
 
-fn parse_quality_profile(
-    raw: Option<&str>,
-) -> Result<audio::StemQualityProfile, AppError> {
+fn parse_quality_profile(raw: Option<&str>) -> Result<audio::StemQualityProfile, AppError> {
     let value = raw
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(audio::DEFAULT_STEM_QUALITY_PROFILE);
 
     audio::StemQualityProfile::from_slug(value).ok_or_else(|| {
-        AppError::bad_request(
-            "Invalid quality profile. Use one of: compact, standard, high.",
-        )
+        AppError::bad_request("Invalid quality profile. Use one of: compact, standard, high.")
     })
 }
 
@@ -1213,9 +1259,7 @@ async fn local_file_response(
     content_disposition: Option<String>,
     range_header: Option<&HeaderValue>,
 ) -> Result<Response, AppError> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(AppError::from)?;
+    let metadata = tokio::fs::metadata(path).await.map_err(AppError::from)?;
     let file_len = metadata.len();
 
     let parsed_range = range_header
@@ -1253,10 +1297,9 @@ async fn local_file_response(
         content_disposition,
     );
     *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::ACCEPT_RANGES,
-        HeaderValue::from_static("bytes"),
-    );
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response.headers_mut().insert(
         header::CONTENT_LENGTH,
         HeaderValue::from_str(&byte_count.to_string())
@@ -1275,7 +1318,10 @@ async fn local_file_response(
     Ok(response)
 }
 
-fn parse_byte_range_header(value: &HeaderValue, file_len: u64) -> Result<Option<(u64, u64)>, AppError> {
+fn parse_byte_range_header(
+    value: &HeaderValue,
+    file_len: u64,
+) -> Result<Option<(u64, u64)>, AppError> {
     if file_len == 0 {
         return Ok(None);
     }
@@ -1290,7 +1336,9 @@ fn parse_byte_range_header(value: &HeaderValue, file_len: u64) -> Result<Option<
         .ok_or_else(|| AppError::bad_request("Only bytes ranges are supported"))?;
 
     if range_spec.contains(',') {
-        return Err(AppError::bad_request("Multiple byte ranges are not supported"));
+        return Err(AppError::bad_request(
+            "Multiple byte ranges are not supported",
+        ));
     }
 
     let (start_raw, end_raw) = range_spec

@@ -61,6 +61,10 @@ export class ScoreViewer {
       {
         autoResize: false,
         backend: 'svg',
+        // Keep explicit rest measures in the rendered model so the cursor/seek
+        // map can advance through sections where upper parts rest while lower
+        // parts continue playing.
+        autoGenerateMultipleRestMeasuresFromRestMeasures: false,
         drawTitle: false,
         drawSubtitle: false,
         drawComposer: false,
@@ -122,6 +126,16 @@ export class ScoreViewer {
     await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
 
     try {
+      const cursor = this.osmd?.cursor
+      if (!cursor) {
+        return
+      }
+
+      // OSMD may otherwise skip hidden/rest-derived positions while walking the
+      // cursor, which truncates our time map on scores whose upper staves go
+      // silent before lower staves do.
+      cursor.SkipInvisibleNotes = false
+
       // buildTimeMap also builds systemMap from cursor element pixel positions.
       // height:auto + overflow:visible (set above) must be in effect here so
       // cursor.cursorElement.getBoundingClientRect() returns real values.
@@ -168,8 +182,9 @@ export class ScoreViewer {
     const map: TimeEntry[] = []
     const geoms: Array<{ top: number; height: number }> = []
 
-    cursor.show()
-    cursor.reset()
+    this.resetCursorIterator(cursor)
+    const iterator = cursor.iterator
+    if (!iterator) return
 
     const containerRect = this.container.getBoundingClientRect()
     let step = 0
@@ -180,9 +195,11 @@ export class ScoreViewer {
     // increasing across repeats (one note = one forward step in time).
     let cumulativeSeconds = 0
 
-    while (!cursor.iterator.EndReached) {
-      const realValue: number = cursor.iterator.currentTimeStamp?.RealValue ?? 0
-      const measureIdx: number = cursor.iterator.CurrentMeasureIndex ?? 0
+    while (!iterator.EndReached) {
+      cursor.update()
+
+      const enrolledValue = this.getIteratorTimestamp(iterator)
+      const measureIdx: number = iterator.CurrentMeasureIndex ?? 0
       const bpm = measureBpm.get(measureIdx) ?? measureBpm.get(0) ?? 120
 
       // Duration of this beat in whole notes, needed when a repeat jump
@@ -207,12 +224,12 @@ export class ScoreViewer {
         geoms.push({ top: -1, height: 0 })
       }
 
-      cursor.next()
+      iterator.moveToNext()
       step++
 
-      if (!cursor.iterator.EndReached) {
-        const nextRealValue: number = cursor.iterator.currentTimeStamp?.RealValue ?? 0
-        const delta = nextRealValue - realValue
+      if (!iterator.EndReached) {
+        const nextEnrolledValue = this.getIteratorTimestamp(iterator)
+        const delta = nextEnrolledValue - enrolledValue
         if (delta > 0) {
           // Normal forward step: use the actual inter-step delta for accuracy.
           cumulativeSeconds += (delta * 240) / bpm
@@ -227,11 +244,32 @@ export class ScoreViewer {
 
     this.timeMap = map
     this.currentStep = 0
-    cursor.reset()
-    cursor.show()
+    this.resetCursorIterator(cursor)
 
     console.log(`[ScoreViewer] walked ${geoms.length} steps (incl. repeats); svgH=${svgH}px`)
     this.buildSystemMapFromGeoms(geoms, svgH)
+  }
+
+  private getIteratorTimestamp(iterator: any): number {
+    return (
+      iterator?.CurrentEnrolledTimestamp?.RealValue ??
+      iterator?.CurrentSourceTimestamp?.RealValue ??
+      iterator?.currentTimeStamp?.RealValue ??
+      0
+    )
+  }
+
+  private resetCursorIterator(cursor: OSMD): void {
+    const manager = this.osmd?.Sheet?.MusicPartManager
+    const iterator = manager?.getIterator?.()
+    if (!iterator) return
+
+    iterator.SkipInvisibleNotes = false
+    cursor.iterator = iterator
+    cursor.show()
+    cursor.update()
+    this.currentStep = 0
+    this.currentSystemIdx = -1
   }
 
   /**
@@ -359,14 +397,16 @@ export class ScoreViewer {
     if (targetStep === this.currentStep) return
 
     if (targetStep < this.currentStep) {
-      cursor.reset()
-      this.currentStep = 0
-      this.currentSystemIdx = -1
+      this.resetCursorIterator(cursor)
     }
 
-    while (this.currentStep < targetStep && !cursor.iterator.EndReached) {
-      cursor.next()
+    const iterator = cursor.iterator
+    if (!iterator) return
+
+    while (this.currentStep < targetStep && !iterator.EndReached) {
+      iterator.moveToNext()
       this.currentStep++
+      cursor.update()
     }
 
     this.flipPageIfNeeded(cursor)
@@ -472,9 +512,9 @@ export class ScoreViewer {
   }
 
   reset(): void {
-    this.osmd?.cursor?.reset()
-    this.currentStep = 0
-    this.currentSystemIdx = -1
+    if (this.osmd?.cursor) {
+      this.resetCursorIterator(this.osmd.cursor)
+    }
     if (this.systemMap.length > 0) {
       this.container.scrollTop = 0
     }

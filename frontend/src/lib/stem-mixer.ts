@@ -137,10 +137,19 @@ export class StemMixerPlayer {
   }
 
   getCurrentTime(): number {
-    const firstTrack = this.tracks.values().next().value as InternalTrack | undefined
-    if (!firstTrack) return this._playbackOffset
+    if (this.tracks.size === 0) return this._playbackOffset
     if (!this._isPlaying) return this._playbackOffset
-    return Math.min(firstTrack.element.currentTime, this._duration)
+
+    // Some rendered stems are shorter than the full arrangement because the
+    // backend trims trailing silence. Using the first inserted track as the
+    // transport clock makes the UI snap backward as soon as that stem ends,
+    // even while longer stems are still playing.
+    let latestTime = this._playbackOffset
+    for (const track of this.tracks.values()) {
+      latestTime = Math.max(latestTime, track.element.currentTime || 0)
+    }
+
+    return Math.min(latestTime, this._duration)
   }
 
   getDuration(): number {

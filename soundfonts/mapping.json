@@ -1,7 +1,7 @@
 {
   "comment": "Maps GM program numbers (as strings) to SFZ paths relative to this directory. 'percussion' covers MIDI channel 9. 'fallback' is used for any program not listed.",
   "fallback": "Soundfont - SGM v2.01.sf2",
-  "percussion": "GM-Drums.sfz",
+  "percussion": "data/Salamander-Drumkit/ALL.sfz",
   "programs": {
     "0": "data/VSCO-2-CE-1.1.0/UprightPiano.sfz",
     "1": "data/VSCO-2-CE-1.1.0/UprightPiano.sfz",

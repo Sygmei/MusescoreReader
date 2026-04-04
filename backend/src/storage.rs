@@ -18,7 +18,9 @@ pub struct Storage {
 
 #[derive(Clone)]
 enum StorageBackend {
-    Local { root: PathBuf },
+    Local {
+        root: PathBuf,
+    },
     S3 {
         bucket: String,
         client: Client,

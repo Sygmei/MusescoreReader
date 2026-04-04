@@ -67,6 +67,15 @@ export type Stem = {
   instrument_name: string
   full_stem_url: string
   duration_seconds: number
+  drum_map?: Array<{
+    pitch: number
+    name: string
+    head?: string | null
+    line?: number | null
+    voice?: number | null
+    stem?: number | null
+    shortcut?: string | null
+  }> | null
 }
 
 type JsonOptions = RequestInit & {
