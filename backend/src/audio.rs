@@ -1318,19 +1318,25 @@ async fn convert_with_musescore(
         .with_context(|| format!("failed to start MuseScore converter '{binary}'"))?;
 
     if !command_output.status.success() {
-        let stderr = String::from_utf8_lossy(&command_output.stderr)
-            .trim()
-            .to_owned();
-        let stdout = String::from_utf8_lossy(&command_output.stdout)
-            .trim()
-            .to_owned();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
+        let stderr = sanitize_musescore_output(String::from_utf8_lossy(&command_output.stderr).as_ref());
+        let stdout = sanitize_musescore_output(String::from_utf8_lossy(&command_output.stdout).as_ref());
+        let status = command_output
+            .status
+            .code()
+            .map(|code| format!("exit code {code}"))
+            .unwrap_or_else(|| "terminated by signal".to_owned());
+        let detail = match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
+            (false, true) => stdout,
+            (true, false) => stderr,
+            (true, true) => String::new(),
+        };
 
         return Ok(ConversionOutcome::Failed {
             reason: if detail.is_empty() {
-                format!("MuseScore converter '{binary}' returned a non-zero exit code.")
+                format!("MuseScore converter '{binary}' failed with {status}.")
             } else {
-                detail
+                format!("MuseScore converter '{binary}' failed with {status}.\n{detail}")
             },
         });
     }
@@ -1349,6 +1355,23 @@ async fn convert_with_musescore(
         content_type,
         extension,
     })
+}
+
+fn sanitize_musescore_output(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && trimmed != "/lib/x86_64-linux-gnu/libOpenGL.so.0"
+                && trimmed != "/lib/x86_64-linux-gnu/libjack.so.0"
+                && trimmed != "/lib/x86_64-linux-gnu/libnss3.so"
+                && trimmed
+                    != "findlib: libpipewire-0.3.so.0: cannot open shared object file: No such file or directory"
+                && trimmed != "/opt/musescore4/AppRun: Using fallback for library 'libpipewire-0.3.so.0'"
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------

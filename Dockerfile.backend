@@ -79,6 +79,7 @@ RUN apt-get update \
         libglib2.0-0 \
         libnss3 \
         libopengl0 \
+        libpipewire-0.3-0 \
         libx11-6 \
         libx11-xcb1 \
         libxcb-cursor0 \
