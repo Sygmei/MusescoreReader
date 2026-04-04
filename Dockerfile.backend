@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM rust:1-bookworm AS build
 
 WORKDIR /app/backend
@@ -9,9 +10,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/Cargo.toml backend/Cargo.lock ./
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    cargo fetch --locked
+
 COPY backend/src ./src
 
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/app/backend/target \
+    cargo build --release --locked
 
 FROM debian:bookworm AS sfizz-build
 
@@ -90,6 +98,8 @@ RUN apt-get update \
         libxcb-xinerama0 \
         libxkbcommon-x11-0 \
         tini \
+        xauth \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid "${APP_GID}" app \
@@ -103,7 +113,7 @@ COPY --from=build /app/backend/target/release/fumen-backend /usr/local/bin/fumen
 COPY --from=sfizz-build /opt/sfizz/bin/sfizz_render /usr/local/bin/sfizz_render
 COPY --from=musescore-build /opt/musescore4 /opt/musescore4
 
-RUN printf '#!/bin/sh\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"\nexport LANG="${LANG:-C.UTF-8}"\nexport LC_ALL="${LC_ALL:-C.UTF-8}"\nexport XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/fumen-musescore-runtime}"\nmkdir -p "$XDG_RUNTIME_DIR"\nexec /opt/musescore4/AppRun "$@"\n' > /usr/local/bin/musescore4 \
+RUN printf '#!/bin/sh\nexport QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"\nexport LANG="${LANG:-C.UTF-8}"\nexport LC_ALL="${LC_ALL:-C.UTF-8}"\nexport XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/fumen-musescore-runtime}"\nmkdir -p "$XDG_RUNTIME_DIR"\nexec xvfb-run -a -s "-screen 0 1280x1024x24" /opt/musescore4/AppRun "$@"\n' > /usr/local/bin/musescore4 \
     && chmod +x /usr/local/bin/musescore4 \
     && ln -s /usr/local/bin/musescore4 /usr/local/bin/musescore
 
