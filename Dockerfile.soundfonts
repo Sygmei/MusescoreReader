@@ -15,7 +15,7 @@ RUN test -f /workspace/soundfonts/mapping.json \
     && test -f /workspace/soundfonts/sources.json
 
 RUN set -euo pipefail; \
-    mkdir -p /opt/soundfonts; \
+    mkdir -p /opt/soundfonts/data; \
     cp /workspace/soundfonts/mapping.json /opt/soundfonts/mapping.json; \
     if [ -f /workspace/soundfonts/gains.json ]; then \
         cp /workspace/soundfonts/gains.json /opt/soundfonts/gains.json; \
@@ -25,7 +25,7 @@ RUN set -euo pipefail; \
         url="$(printf '%s' "$entry" | base64 -d | jq -r '.value')"; \
         archive="/tmp/archive.zip"; \
         extract_dir="/tmp/extract"; \
-        install_dir="/opt/soundfonts/$name"; \
+        install_dir="/opt/soundfonts/data/$name"; \
         rm -rf "$archive" "$extract_dir" "$install_dir"; \
         mkdir -p "$extract_dir" "$install_dir"; \
         curl -L --fail --retry 3 --output "$archive" "$url"; \

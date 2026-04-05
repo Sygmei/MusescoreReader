@@ -141,7 +141,7 @@ export class MidiMixerPlayer {
       return
     }
 
-    track.volume = clamp(volume, 0, 1)
+    track.volume = clamp(volume, 0, 2)
     track.gain.gain.rampTo(track.muted ? 0 : track.volume, 0.05)
   }
 

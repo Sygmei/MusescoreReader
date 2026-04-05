@@ -4,10 +4,10 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use roxmltree::{Document, Node, ParsingOptions};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use zip::ZipArchive;
@@ -143,6 +143,375 @@ fn lookup_gain(mapping: &SfzMapping, rel_path: Option<&str>, semantic_keys: &[&s
     }
 
     0.0
+}
+
+#[derive(Debug)]
+struct ScoreProgramAssignment {
+    is_percussion: bool,
+    program: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct MuseScoreAudioSettings {
+    #[serde(default)]
+    tracks: Vec<MuseScoreAudioTrack>,
+}
+
+#[derive(serde::Deserialize)]
+struct MuseScoreAudioTrack {
+    #[serde(rename = "partId")]
+    part_id: String,
+    out: MuseScoreAudioTrackOut,
+}
+
+#[derive(serde::Deserialize)]
+struct MuseScoreAudioTrackOut {
+    #[serde(rename = "volumeDb")]
+    volume_db: f64,
+}
+
+pub async fn export_score_gain_template(
+    config: &AppConfig,
+    score_path: &Path,
+) -> Result<BTreeMap<String, f64>> {
+    let sfz_dir = find_soundfont_dir(config).with_context(|| {
+        "soundfont directory not found. Set SOUNDFONT_DIR or provide ./soundfonts with mapping.json"
+    })?;
+    let mapping = load_sfz_mapping(&sfz_dir).await?;
+    let mut exported = semantic_gain_template(&mapping);
+    let xml = read_primary_musescore_xml(score_path)?
+        .with_context(|| format!("no primary .mscx score found in {}", score_path.display()))?;
+    let assignments = parse_score_program_assignments(&xml)?;
+    let audio_settings_text = read_archive_text_entry(score_path, "audiosettings.json")?
+        .with_context(|| format!("no audiosettings.json found in {}", score_path.display()))?;
+    let audio_settings: MuseScoreAudioSettings = serde_json::from_str(&audio_settings_text)
+        .with_context(|| format!("parsing audiosettings.json in {}", score_path.display()))?;
+
+    let mut contributions: HashMap<String, (f64, usize)> = HashMap::new();
+    for track in audio_settings.tracks {
+        let Some(assignment) = assignments.get(&track.part_id) else {
+            continue;
+        };
+
+        for alias in score_assignment_gain_aliases(assignment, &mapping) {
+            let entry = contributions.entry(alias).or_insert((0.0, 0));
+            entry.0 += track.out.volume_db;
+            entry.1 += 1;
+        }
+    }
+
+    if contributions.is_empty() {
+        anyhow::bail!(
+            "Could not match any score mixer tracks to soundfont gain aliases in {}",
+            score_path.display()
+        );
+    }
+
+    for (alias, (sum, count)) in contributions {
+        exported.insert(alias, round_gain_db(sum / count as f64));
+    }
+
+    Ok(exported)
+}
+
+#[derive(Clone, Debug)]
+pub struct LiveMixerTrackSetting {
+    pub track_index: usize,
+    pub volume_multiplier: f64,
+    pub muted: bool,
+}
+
+pub async fn export_live_mixer_gain_template(
+    config: &AppConfig,
+    midi_bytes: &[u8],
+    track_settings: &[LiveMixerTrackSetting],
+) -> Result<BTreeMap<String, f64>> {
+    let sfz_dir = find_soundfont_dir(config).with_context(|| {
+        "soundfont directory not found. Set SOUNDFONT_DIR or provide ./soundfonts with mapping.json"
+    })?;
+    let mapping = load_sfz_mapping(&sfz_dir).await?;
+    let mut exported = current_semantic_gain_template(&mapping);
+    let track_infos = parse_midi_tracks(midi_bytes);
+
+    if track_infos.is_empty() {
+        anyhow::bail!("No instrument tracks found in MIDI export");
+    }
+
+    if track_settings.is_empty() {
+        anyhow::bail!("No mixer tracks provided for gain export");
+    }
+
+    let mut contributions: HashMap<String, (f64, usize)> = HashMap::new();
+    for setting in track_settings {
+        let Some(track_info) = track_infos.get(setting.track_index) else {
+            continue;
+        };
+
+        let assignment = ScoreProgramAssignment {
+            is_percussion: track_info.is_percussion,
+            program: Some(track_info.program.to_string()),
+        };
+        let aliases = score_assignment_gain_aliases(&assignment, &mapping);
+        if aliases.is_empty() {
+            continue;
+        }
+
+        let delta_db = mixer_multiplier_to_gain_db(setting.volume_multiplier, setting.muted);
+        for alias in aliases {
+            let baseline_gain = mapping.gains.get(&alias).copied().unwrap_or(0.0);
+            let target_gain = round_gain_db(baseline_gain + delta_db);
+            let entry = contributions.entry(alias).or_insert((0.0, 0));
+            entry.0 += target_gain;
+            entry.1 += 1;
+        }
+    }
+
+    if contributions.is_empty() {
+        anyhow::bail!("Could not match any mixer tracks to soundfont gain aliases");
+    }
+
+    for (alias, (sum, count)) in contributions {
+        exported.insert(alias, round_gain_db(sum / count as f64));
+    }
+
+    Ok(exported)
+}
+
+fn semantic_gain_template(mapping: &SfzMapping) -> BTreeMap<String, f64> {
+    let mut gains = BTreeMap::new();
+
+    if mapping.percussion.is_some() {
+        gains.insert("percussion".to_owned(), 0.0);
+    }
+
+    if mapping.fallback.is_some() {
+        gains.insert("fallback".to_owned(), 0.0);
+    }
+
+    for (program, entry) in &mapping.programs {
+        gains.insert(program.clone(), 0.0);
+
+        if let ProgramEntry::Detailed(detail) = entry {
+            if detail.staccato.is_some() {
+                gains.insert(format!("{program}.staccato"), 0.0);
+            }
+            if detail.vibrato.is_some() {
+                gains.insert(format!("{program}.vibrato"), 0.0);
+            }
+            for override_program in detail.overrides.keys() {
+                gains.insert(format!("{program}.override.{override_program}"), 0.0);
+            }
+        }
+    }
+
+    gains
+}
+
+fn current_semantic_gain_template(mapping: &SfzMapping) -> BTreeMap<String, f64> {
+    let mut gains = semantic_gain_template(mapping);
+    for (alias, value) in &mut gains {
+        *value = mapping.gains.get(alias).copied().unwrap_or(0.0);
+    }
+    gains
+}
+
+fn score_assignment_gain_aliases(
+    assignment: &ScoreProgramAssignment,
+    mapping: &SfzMapping,
+) -> Vec<String> {
+    if assignment.is_percussion {
+        return mapping
+            .percussion
+            .as_ref()
+            .map(|_| vec!["percussion".to_owned()])
+            .unwrap_or_default();
+    }
+
+    let Some(program) = assignment.program.as_deref() else {
+        return mapping
+            .fallback
+            .as_ref()
+            .map(|_| vec!["fallback".to_owned()])
+            .unwrap_or_default();
+    };
+
+    let Some(entry) = mapping.programs.get(program) else {
+        return mapping
+            .fallback
+            .as_ref()
+            .map(|_| vec!["fallback".to_owned()])
+            .unwrap_or_default();
+    };
+
+    let mut aliases = vec![program.to_owned()];
+    if let ProgramEntry::Detailed(detail) = entry {
+        if detail.staccato.is_some() {
+            aliases.push(format!("{program}.staccato"));
+        }
+        if detail.vibrato.is_some() {
+            aliases.push(format!("{program}.vibrato"));
+        }
+        for override_program in detail.overrides.keys() {
+            aliases.push(format!("{program}.override.{override_program}"));
+        }
+    }
+
+    aliases
+}
+
+fn round_gain_db(value: f64) -> f64 {
+    (value * 10.0).round() / 10.0
+}
+
+fn mixer_multiplier_to_gain_db(volume_multiplier: f64, muted: bool) -> f64 {
+    const MIN_GAIN_DB: f64 = -60.0;
+
+    if muted || volume_multiplier <= 0.0 {
+        return MIN_GAIN_DB;
+    }
+
+    round_gain_db(20.0 * volume_multiplier.log10())
+}
+
+fn parse_score_program_assignments(xml: &str) -> Result<HashMap<String, ScoreProgramAssignment>> {
+    let document = Document::parse(xml).context("parsing MuseScore score XML")?;
+    let mut assignments = HashMap::new();
+
+    for part in document
+        .descendants()
+        .filter(|node| node.has_tag_name("Part"))
+    {
+        let Some(part_id) = part.attribute("id").map(str::to_owned) else {
+            continue;
+        };
+        let Some(instrument) = part
+            .children()
+            .find(|child| child.is_element() && child.has_tag_name("Instrument"))
+        else {
+            continue;
+        };
+
+        let is_percussion = instrument
+            .children()
+            .find(|child| child.is_element() && child.has_tag_name("useDrumset"))
+            .and_then(|node| node.text())
+            .is_some_and(|value| value.trim() == "1");
+
+        let channels: Vec<Node<'_, '_>> = instrument
+            .children()
+            .filter(|child| child.is_element() && child.has_tag_name("Channel"))
+            .collect();
+        let preferred_channel = channels
+            .iter()
+            .find(|channel| channel.attribute("name").is_none())
+            .copied()
+            .or_else(|| channels.first().copied());
+
+        let program = preferred_channel
+            .and_then(|channel| {
+                channel
+                    .children()
+                    .find(|child| child.is_element() && child.has_tag_name("program"))
+            })
+            .and_then(|node| node.attribute("value"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
+        assignments.insert(
+            part_id,
+            ScoreProgramAssignment {
+                is_percussion,
+                program,
+            },
+        );
+    }
+
+    Ok(assignments)
+}
+
+fn read_primary_musescore_xml(score_path: &Path) -> Result<Option<String>> {
+    if score_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mscx"))
+    {
+        let xml = std::fs::read_to_string(score_path)
+            .with_context(|| format!("reading {}", score_path.display()))?;
+        return Ok(Some(xml));
+    }
+
+    let file = File::open(score_path)
+        .with_context(|| format!("opening MuseScore archive {}", score_path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).with_context(|| format!("reading {}", score_path.display()))?;
+    let Some(mscx_name) = find_primary_musescore_entry_name(&mut archive) else {
+        return Ok(None);
+    };
+
+    let mut entry = archive
+        .by_name(&mscx_name)
+        .with_context(|| format!("opening '{mscx_name}' in {}", score_path.display()))?;
+    let mut xml = String::new();
+    entry
+        .read_to_string(&mut xml)
+        .with_context(|| format!("reading '{mscx_name}' in {}", score_path.display()))?;
+
+    Ok(Some(xml))
+}
+
+fn read_archive_text_entry(score_path: &Path, entry_name: &str) -> Result<Option<String>> {
+    if score_path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mscx"))
+    {
+        return Ok(None);
+    }
+
+    let file = File::open(score_path)
+        .with_context(|| format!("opening MuseScore archive {}", score_path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).with_context(|| format!("reading {}", score_path.display()))?;
+
+    let mut entry = match archive.by_name(entry_name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("opening '{entry_name}' in {}", score_path.display()));
+        }
+    };
+
+    let mut text = String::new();
+    entry
+        .read_to_string(&mut text)
+        .with_context(|| format!("reading '{entry_name}' in {}", score_path.display()))?;
+
+    Ok(Some(text))
+}
+
+fn find_primary_musescore_entry_name<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+) -> Option<String> {
+    (0..archive.len())
+        .filter_map(|idx| {
+            archive
+                .by_index(idx)
+                .ok()
+                .map(|entry| entry.name().to_owned())
+        })
+        .find(|name| name.ends_with(".mscx") && !name.contains('/'))
+        .or_else(|| {
+            (0..archive.len())
+                .filter_map(|idx| {
+                    archive
+                        .by_index(idx)
+                        .ok()
+                        .map(|entry| entry.name().to_owned())
+                })
+                .find(|name| name.ends_with(".mscx") && !name.starts_with("Excerpts/"))
+        })
 }
 
 fn extract_musescore_drumset_mappings(score_path: &Path) -> Result<DrumsetMappingMap> {
@@ -565,6 +934,7 @@ pub async fn generate_stems(
         mid_path: PathBuf,
         wav_path: PathBuf,
         gain_db: f64,
+        gain_label: String,
     }
 
     let mut task_list: Vec<StemTask> = Vec::new();
@@ -604,6 +974,19 @@ pub async fn generate_stems(
             track_info.program,
             sfz_path.file_name().unwrap_or_default().to_string_lossy(),
         );
+
+        let drum_map = track_info
+            .is_percussion
+            .then(|| {
+                drumset_mappings
+                    .get(&normalize_track_lookup_key(&track_info.track_name))
+                    .cloned()
+            })
+            .flatten();
+        let percussion_note_remap = track_info
+            .is_percussion
+            .then(|| percussion_note_remap_for_soundfont(&sfz_path, drum_map.as_deref()))
+            .filter(|remap| !remap.is_empty());
 
         // --- Program-change override split ---------------------------------
         // When a track contains in-track GM program changes (e.g. violins
@@ -670,6 +1053,7 @@ pub async fn generate_stems(
                                 mid_path: output_dir.join(format!("stem_{chunk_idx}_x{n}.mid")),
                                 wav_path: output_dir.join(format!("stem_{chunk_idx}_x{n}.wav")),
                                 gain_db: gain,
+                                gain_label: gain_key,
                             });
                         } else {
                             tracing::warn!(
@@ -681,7 +1065,11 @@ pub async fn generate_stems(
                 }
                 (canon_mtrk, extras)
             } else {
-                (chunks[chunk_idx].to_vec(), Vec::new())
+                let canonical_mtrk = percussion_note_remap
+                    .as_ref()
+                    .map(|remap| remap_track_channel_notes(&midi_bytes, chunk_idx, remap))
+                    .unwrap_or_else(|| chunks[chunk_idx].to_vec());
+                (canonical_mtrk, Vec::new())
             }
         };
 
@@ -747,15 +1135,6 @@ pub async fn generate_stems(
         } else {
             lookup_gain(&sfz_mapping, main_rel_path.as_deref(), &["fallback"])
         };
-        let drum_map = track_info
-            .is_percussion
-            .then(|| {
-                drumset_mappings
-                    .get(&normalize_track_lookup_key(&track_info.track_name))
-                    .cloned()
-            })
-            .flatten();
-
         let staccato_key = format!("{}.staccato", track_info.program);
         let staccato_rel_path = staccato_sfz
             .as_ref()
@@ -774,6 +1153,40 @@ pub async fn generate_stems(
             &sfz_mapping,
             vibrato_rel_path.as_deref(),
             &[vibrato_key.as_str()],
+        );
+        let extra_gain_summary = if extra_stems.is_empty() {
+            "none".to_owned()
+        } else {
+            extra_stems
+                .iter()
+                .map(|extra| format!("{}={:+.1}dB", extra.gain_label, extra.gain_db))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        tracing::info!(
+            "stems: [{}/{}] '{}' – gains main({})={:+.1}dB, staccato({})={}, vibrato({})={}, extras=[{}]",
+            stem_idx + 1,
+            total,
+            track_info.track_name,
+            if track_info.is_percussion {
+                "percussion"
+            } else if sfz_mapping.programs.contains_key(&program_key) {
+                program_key.as_str()
+            } else {
+                "fallback"
+            },
+            gain_db,
+            staccato_key,
+            staccato_sfz
+                .as_ref()
+                .map(|_| format!("{:+.1}dB", staccato_gain_db))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            vibrato_key,
+            vibrato_sfz
+                .as_ref()
+                .map(|_| format!("{:+.1}dB", vibrato_gain_db))
+                .unwrap_or_else(|| "n/a".to_owned()),
+            extra_gain_summary,
         );
 
         task_list.push(StemTask {
@@ -1123,6 +1536,24 @@ pub async fn generate_stems(
             for (wav, gain) in &extra_wav_ok {
                 sources.push((wav, *gain));
             }
+            let mut source_gain_labels = vec![format!("main={:+.1}dB", task.gain_db)];
+            if staccato_wave_ok {
+                source_gain_labels.push(format!("staccato={:+.1}dB", task.staccato_gain_db));
+            }
+            if vibrato_wave_ok {
+                source_gain_labels.push(format!("vibrato={:+.1}dB", task.vibrato_gain_db));
+            }
+            for (extra, (_, gain)) in task.extra_stems.iter().zip(extra_wav_ok.iter()) {
+                source_gain_labels.push(format!("{}={:+.1}dB", extra.gain_label, gain));
+            }
+            tracing::info!(
+                "stems: [{}/{}] '{}' – mixing {} source(s): {}",
+                task.stem_idx + 1,
+                total,
+                task.track_name,
+                sources.len(),
+                source_gain_labels.join(", "),
+            );
             let mut ffmpeg_cmd = Command::new(&task.ffmpeg);
             ffmpeg_cmd.arg("-y");
             for (path, _) in &sources {
@@ -2459,6 +2890,251 @@ fn normalize_track_lookup_key(name: &str) -> String {
     normalized
 }
 
+fn normalize_drum_name_lookup_key(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => {
+                normalized.push('a')
+            }
+            'ç' | 'Ç' => normalized.push('c'),
+            'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => normalized.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => normalized.push('i'),
+            'ñ' | 'Ñ' => normalized.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => {
+                normalized.push('o')
+            }
+            'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => normalized.push('u'),
+            'ý' | 'ÿ' | 'Ý' | 'Ÿ' => normalized.push('y'),
+            'æ' | 'Æ' => normalized.push_str("ae"),
+            'œ' | 'Œ' => normalized.push_str("oe"),
+            _ if ch.is_alphanumeric() => normalized.extend(ch.to_lowercase()),
+            _ => {}
+        }
+    }
+    normalized
+}
+
+fn is_salamander_drumkit_path(sfz_path: &Path) -> bool {
+    sfz_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/salamander-drumkit/all.sfz")
+}
+
+fn salamander_key_for_gm_pitch(pitch: u8) -> Option<u8> {
+    match pitch {
+        35 | 36 => Some(35),
+        37 => Some(41),
+        38 | 40 => Some(38),
+        41 | 43 | 45 | 47 => Some(43),
+        42 => Some(42),
+        44 => Some(44),
+        46 => Some(46),
+        48 | 50 => Some(45),
+        49 => Some(55),
+        51 => Some(52),
+        52 => Some(59),
+        53 => Some(53),
+        55 => Some(63),
+        57 => Some(57),
+        _ => None,
+    }
+}
+
+fn salamander_key_for_drum_name(name: &str) -> Option<u8> {
+    let key = normalize_drum_name_lookup_key(name);
+
+    if key.contains("crossstick")
+        || key.contains("sidestick")
+        || key.contains("rimclick")
+        || key.contains("rimshot")
+        || key.contains("snarestick")
+    {
+        return Some(41);
+    }
+    if key.contains("ridebell") || key.contains("clocheride") || key.contains("bellride") {
+        return Some(53);
+    }
+    if key.contains("splash") {
+        return Some(63);
+    }
+    if key.contains("china2") {
+        return Some(60);
+    }
+    if key.contains("china") {
+        return Some(59);
+    }
+    if key.contains("crash2") || key.contains("cymbalecrash2") {
+        return Some(57);
+    }
+    if key.contains("crash") || key.contains("cymbalecrash") {
+        return Some(55);
+    }
+    if key.contains("ridecymbal") || key == "ride" || key.contains("cymbaleride") {
+        return Some(52);
+    }
+    if key.contains("openhihat") || key.contains("charlestonouverte") {
+        return Some(46);
+    }
+    if key.contains("pedalhihat")
+        || key.contains("foothihat")
+        || key.contains("hihatfoot")
+        || key.contains("charlestonpied")
+    {
+        return Some(44);
+    }
+    if key.contains("semiopenhihat")
+        || key.contains("halfopenhihat")
+        || key.contains("halfopenhihat")
+        || key.contains("charlestondemiouvert")
+        || key.contains("charlestonsemiouvert")
+    {
+        return Some(42);
+    }
+    if key.contains("closedhihat") || key.contains("charlestonferme") {
+        return Some(42);
+    }
+    if key.contains("bellchime") {
+        return Some(64);
+    }
+    if key.contains("cowbell") {
+        return Some(47);
+    }
+    if key.contains("floortom")
+        || key.contains("lowtom")
+        || key.contains("lotom")
+        || key.contains("tombasse")
+        || key.contains("tomgrave")
+    {
+        return Some(43);
+    }
+    if key.contains("hightom")
+        || key.contains("hitom")
+        || key.contains("tomaigu")
+        || key.contains("tomhaut")
+    {
+        return Some(45);
+    }
+    if key.contains("bassdrum") || key.contains("kick") || key == "bd" {
+        return Some(35);
+    }
+    if key.contains("snare") || key.contains("caisseclaire") {
+        return Some(38);
+    }
+
+    None
+}
+
+fn salamander_key_for_drum_entry(entry: &DrumMapEntry) -> Option<u8> {
+    salamander_key_for_drum_name(&entry.name).or_else(|| salamander_key_for_gm_pitch(entry.pitch))
+}
+
+fn percussion_note_remap_for_soundfont(
+    sfz_path: &Path,
+    drum_map: Option<&[DrumMapEntry]>,
+) -> HashMap<u8, u8> {
+    if !is_salamander_drumkit_path(sfz_path) {
+        return HashMap::new();
+    }
+
+    let mut remap = HashMap::new();
+
+    if let Some(entries) = drum_map {
+        for entry in entries {
+            if let Some(target) = salamander_key_for_drum_entry(entry) {
+                if target != entry.pitch {
+                    remap.insert(entry.pitch, target);
+                }
+            }
+        }
+        return remap;
+    }
+
+    for pitch in 0u8..=127 {
+        if let Some(target) = salamander_key_for_gm_pitch(pitch) {
+            if target != pitch {
+                remap.insert(pitch, target);
+            }
+        }
+    }
+
+    remap
+}
+
+fn encode_midi_event_with_note_remap(
+    channel: u8,
+    message: &MidiMessage,
+    note_remap: &HashMap<u8, u8>,
+) -> Vec<u8> {
+    match message {
+        MidiMessage::NoteOn { key, vel } => vec![
+            0x90 | channel,
+            note_remap
+                .get(&u8::from(*key))
+                .copied()
+                .unwrap_or_else(|| u8::from(*key)),
+            u8::from(*vel),
+        ],
+        MidiMessage::NoteOff { key, vel } => vec![
+            0x80 | channel,
+            note_remap
+                .get(&u8::from(*key))
+                .copied()
+                .unwrap_or_else(|| u8::from(*key)),
+            u8::from(*vel),
+        ],
+        MidiMessage::Aftertouch { key, vel } => vec![
+            0xA0 | channel,
+            note_remap
+                .get(&u8::from(*key))
+                .copied()
+                .unwrap_or_else(|| u8::from(*key)),
+            u8::from(*vel),
+        ],
+        _ => encode_midi_event(channel, message),
+    }
+}
+
+fn remap_track_channel_notes(
+    midi_bytes: &[u8],
+    track_idx: usize,
+    note_remap: &HashMap<u8, u8>,
+) -> Vec<u8> {
+    let smf = match Smf::parse(midi_bytes) {
+        Ok(smf) => smf,
+        Err(error) => {
+            tracing::warn!("stems: could not parse MIDI for percussion remap: {error}");
+            return extract_raw_midi_chunks(midi_bytes)
+                .get(track_idx)
+                .map(|chunk| chunk.to_vec())
+                .unwrap_or_else(|| build_mtrk(Vec::new()));
+        }
+    };
+
+    let Some(track) = smf.tracks.get(track_idx) else {
+        return build_mtrk(Vec::new());
+    };
+
+    let mut abs = 0u32;
+    let mut events = Vec::new();
+
+    for event in track {
+        abs = abs.saturating_add(u32::from(event.delta));
+        let TrackEventKind::Midi { channel, message } = &event.kind else {
+            continue;
+        };
+
+        let encoded = encode_midi_event_with_note_remap(u8::from(*channel), message, note_remap);
+        if !encoded.is_empty() {
+            events.push((abs, encoded));
+        }
+    }
+
+    build_mtrk(events)
+}
+
 fn collect_part_forced_programs(part: Node<'_, '_>) -> Vec<Option<u8>> {
     let mut pizzicato_active = false;
     let mut forced_programs = Vec::new();
@@ -2534,9 +3210,42 @@ fn is_sounded_musicxml_note(note: Node<'_, '_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppConfig, StorageConfig};
 
     fn fixture_path(relative: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+    }
+
+    fn test_config() -> AppConfig {
+        AppConfig {
+            bind_address: "127.0.0.1:3000".to_owned(),
+            admin_password: "test".to_owned(),
+            app_base_url: "http://localhost:5173".to_owned(),
+            database_url: "postgres://localhost/test".to_owned(),
+            database_url_admin: "postgres://localhost/test".to_owned(),
+            database_url_read_only: "postgres://localhost/test".to_owned(),
+            storage: StorageConfig::Local {
+                root: fixture_path("data/storage"),
+            },
+            musescore_bin: None,
+            musescore_docker_image: None,
+            musescore_qt_platform: None,
+            docker_bin: "docker".to_owned(),
+            soundfont_dir: Some(fixture_path("../soundfonts")),
+            sfizz_bin: None,
+            fluidsynth_bin: None,
+        }
+    }
+
+    fn build_test_midi_single_track(track_chunk: Vec<u8>) -> Vec<u8> {
+        let mut midi = Vec::new();
+        midi.extend_from_slice(b"MThd");
+        midi.extend_from_slice(&[0, 0, 0, 6]);
+        midi.extend_from_slice(&[0, 0]);
+        midi.extend_from_slice(&[0, 1]);
+        midi.extend_from_slice(&[0x01, 0xE0]);
+        midi.extend_from_slice(&track_chunk);
+        midi
     }
 
     #[test]
@@ -2577,6 +3286,61 @@ mod tests {
     }
 
     #[test]
+    fn score_assignment_gain_aliases_include_articulations() {
+        let mapping = SfzMapping {
+            percussion: Some("drums.sfz".to_owned()),
+            fallback: Some("fallback.sf2".to_owned()),
+            programs: HashMap::from([(
+                "56".to_owned(),
+                ProgramEntry::Detailed(ProgramDetail {
+                    sfz: "TrumpetSus.sfz".to_owned(),
+                    staccato: Some("TrumpetStac.sfz".to_owned()),
+                    vibrato: Some("TrumpetVib.sfz".to_owned()),
+                    overrides: HashMap::from([("45".to_owned(), "TrumpetPizz.sfz".to_owned())]),
+                }),
+            )]),
+            gains: HashMap::new(),
+        };
+
+        let aliases = score_assignment_gain_aliases(
+            &ScoreProgramAssignment {
+                is_percussion: false,
+                program: Some("56".to_owned()),
+            },
+            &mapping,
+        );
+
+        assert!(aliases.contains(&"56".to_owned()));
+        assert!(aliases.contains(&"56.staccato".to_owned()));
+        assert!(aliases.contains(&"56.vibrato".to_owned()));
+        assert!(aliases.contains(&"56.override.45".to_owned()));
+    }
+
+    #[test]
+    fn mixer_multiplier_to_gain_db_maps_expected_reference_points() {
+        assert_eq!(mixer_multiplier_to_gain_db(0.0, false), -60.0);
+        assert_eq!(mixer_multiplier_to_gain_db(1.0, false), 0.0);
+        assert_eq!(mixer_multiplier_to_gain_db(2.0, false), 6.0);
+    }
+
+    #[tokio::test]
+    async fn exports_score_gain_template_from_fixture_audiosettings() {
+        let gains = export_score_gain_template(
+            &test_config(),
+            &fixture_path(
+                "data/storage/scores/068b3354-2c69-4691-8359-7bfb90c026f5/Chrono_Trigger_-_Main_Theme.mscz",
+            ),
+        )
+        .await
+        .expect("fixture gain export should succeed");
+
+        assert_eq!(gains.get("46"), Some(&-0.7));
+        assert_eq!(gains.get("66"), Some(&0.7));
+        assert!(gains.get("48.staccato").is_some_and(|value| *value > 0.0));
+        assert!(gains.contains_key("percussion"));
+    }
+
+    #[test]
     fn extracts_drumset_mappings_from_musescore_archive() {
         let mappings = extract_musescore_drumset_mappings(&fixture_path(
             "data/storage/scores/068b3354-2c69-4691-8359-7bfb90c026f5/Chrono_Trigger_-_Main_Theme.mscz",
@@ -2609,6 +3373,84 @@ mod tests {
             normalize_track_lookup_key("Trompette en Si♭"),
             normalize_track_lookup_key("Trompette en Sib")
         );
+    }
+
+    #[test]
+    fn salamander_drum_name_mapping_handles_localized_musescore_names() {
+        assert_eq!(salamander_key_for_drum_name("Bass Drum"), Some(35));
+        assert_eq!(salamander_key_for_drum_name("Cross-stick"), Some(41));
+        assert_eq!(salamander_key_for_drum_name("Charleston Ouverte"), Some(46));
+        assert_eq!(salamander_key_for_drum_name("Tom Basse"), Some(43));
+        assert_eq!(salamander_key_for_drum_name("Tom Aigu"), Some(45));
+        assert_eq!(salamander_key_for_drum_name("Cloche ride"), Some(53));
+        assert_eq!(salamander_key_for_drum_name("Cymbale splash"), Some(63));
+    }
+
+    #[test]
+    fn remap_track_channel_notes_rewrites_percussion_keys_for_salamander() {
+        let original = build_test_midi_single_track(build_mtrk(vec![
+            (0, vec![0x99, 49, 100]),
+            (120, vec![0x89, 49, 0]),
+            (240, vec![0x99, 51, 96]),
+            (360, vec![0x89, 51, 0]),
+        ]));
+        let remapped_chunk =
+            remap_track_channel_notes(&original, 0, &HashMap::from([(49u8, 55u8), (51u8, 52u8)]));
+        let remapped = build_test_midi_single_track(remapped_chunk);
+        let smf = Smf::parse(&remapped).expect("remapped midi should parse");
+
+        let note_ons: Vec<u8> = smf.tracks[0]
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TrackEventKind::Midi {
+                    message: MidiMessage::NoteOn { key, vel },
+                    ..
+                } if u8::from(*vel) > 0 => Some(u8::from(*key)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(note_ons, vec![55, 52]);
+    }
+
+    #[test]
+    fn salamander_percussion_remap_uses_musescore_drum_names() {
+        let remap = percussion_note_remap_for_soundfont(
+            Path::new("soundfonts/data/Salamander-Drumkit/ALL.sfz"),
+            Some(&[
+                DrumMapEntry {
+                    pitch: 49,
+                    name: "Crash Cymbal".to_owned(),
+                    head: None,
+                    line: None,
+                    voice: None,
+                    stem: None,
+                    shortcut: None,
+                },
+                DrumMapEntry {
+                    pitch: 51,
+                    name: "Ride Cymbal".to_owned(),
+                    head: None,
+                    line: None,
+                    voice: None,
+                    stem: None,
+                    shortcut: None,
+                },
+                DrumMapEntry {
+                    pitch: 53,
+                    name: "Cloche ride".to_owned(),
+                    head: None,
+                    line: None,
+                    voice: None,
+                    stem: None,
+                    shortcut: None,
+                },
+            ]),
+        );
+
+        assert_eq!(remap.get(&49), Some(&55));
+        assert_eq!(remap.get(&51), Some(&52));
+        assert!(!remap.contains_key(&53));
     }
 
     #[test]

@@ -46,6 +46,17 @@ impl Storage {
     }
 
     pub async fn upload_bytes(&self, key: &str, bytes: Bytes, content_type: &str) -> Result<()> {
+        self.upload_bytes_with_encoding(key, bytes, content_type, None)
+            .await
+    }
+
+    pub async fn upload_bytes_with_encoding(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        content_type: &str,
+        content_encoding: Option<&str>,
+    ) -> Result<()> {
         match &self.backend {
             StorageBackend::Local { root } => {
                 let path = path_for_key(root, key);
@@ -54,38 +65,45 @@ impl Storage {
                 }
 
                 fs::write(path, bytes).await?;
-                let _ = content_type;
+                let _ = (content_type, content_encoding);
                 Ok(())
             }
             StorageBackend::S3 { bucket, client, .. } => {
-                client
+                let mut request = client
                     .put_object()
                     .bucket(bucket)
                     .key(key)
                     .acl(ObjectCannedAcl::PublicRead)
                     .content_type(content_type)
-                    .body(ByteStream::from(bytes.to_vec()))
-                    .send()
-                    .await?;
+                    .body(ByteStream::from(bytes.to_vec()));
+                if let Some(content_encoding) = content_encoding {
+                    request = request.content_encoding(content_encoding);
+                }
+                request.send().await?;
                 Ok(())
             }
         }
     }
 
-    pub async fn get_bytes(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    pub async fn get_bytes(&self, key: &str) -> Result<(Bytes, Option<String>, Option<String>)> {
         match &self.backend {
             StorageBackend::Local { root } => {
                 let path = path_for_key(root, key);
                 let bytes = fs::read(path).await?;
-                Ok((Bytes::from(bytes), None))
+                Ok((Bytes::from(bytes), None, None))
             }
             StorageBackend::S3 { bucket, client, .. } => {
                 let response = client.get_object().bucket(bucket).key(key).send().await?;
                 let content_type = response.content_type().map(ToOwned::to_owned);
+                let content_encoding = response.content_encoding().map(ToOwned::to_owned);
                 let bytes = response.body.collect().await?.into_bytes();
-                Ok((bytes, content_type))
+                Ok((bytes, content_type, content_encoding))
             }
         }
+    }
+
+    pub fn is_s3(&self) -> bool {
+        matches!(self.backend, StorageBackend::S3 { .. })
     }
 
     pub fn public_url(&self, key: &str) -> Option<String> {

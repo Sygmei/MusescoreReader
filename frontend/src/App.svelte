@@ -11,12 +11,12 @@
     uploadMusic,
     type AdminMusic,
     type PublicMusic,
-    type Stem,
     type StemQualityProfile,
   } from './lib/api'
   import { MidiMixerPlayer, type MixerTrack } from './lib/midi-player'
   import { StemMixerPlayer, type StemTrack } from './lib/stem-mixer'
   import { ScoreViewer } from './lib/score-viewer'
+  import Mixer from './components/Mixer.svelte'
 
   const storedPassword =
     typeof window !== 'undefined' ? window.localStorage.getItem('admin-password') ?? '' : ''
@@ -25,44 +25,46 @@
   const publicAccessKey = routeMatch ? decodeURIComponent(routeMatch[1]) : null
   const isPublicRoute = publicAccessKey !== null
 
-  let adminPassword = storedPassword
-  let adminLoggedIn = false
-  let adminLoading = false
-  let adminError = ''
-  let adminSuccess = ''
-  let uploadTitle = ''
-  let uploadPublicId = ''
-  let uploadQualityProfile: StemQualityProfile = 'standard'
-  let selectedFile: File | null = null
-  let uploadBusy = false
-  let musics: AdminMusic[] = []
-  let editPublicIds: Record<string, string> = {}
-  let savingIdFor = ''
-  let retryingFor = ''
+  let adminPassword = $state(storedPassword)
+  let adminLoggedIn = $state(false)
+  let adminLoading = $state(false)
+  let adminError = $state('')
+  let adminSuccess = $state('')
+  let uploadTitle = $state('')
+  let uploadPublicId = $state('')
+  let uploadQualityProfile = $state<StemQualityProfile>('standard')
+  let selectedFile = $state<File | null>(null)
+  let uploadBusy = $state(false)
+  let musics = $state<AdminMusic[]>([])
+  let editPublicIds = $state<Record<string, string>>({})
+  let savingIdFor = $state('')
+  let retryingFor = $state('')
 
-  let publicMusic: PublicMusic | null = null
-  let publicLoading = false
-  let publicError = ''
-  let mixerRequested = false
+  let publicMusic = $state<PublicMusic | null>(null)
+  let publicLoading = $state(false)
+  let publicError = $state('')
+  let downloadMenuOpen = $state(false)
+  let mixerRequested = $state(false)
 
-  let scoreViewer: ScoreViewer | null = null
-  let scoreContainer: HTMLElement | null = null
-  let scoreLoading = false
-  let scoreLoaded = false
-  let scoreError = ''
+  let scoreViewer = $state<ScoreViewer | null>(null)
+  let scoreContainer = $state<HTMLElement | null>(null)
+  let scoreLoading = $state(false)
+  let scoreLoaded = $state(false)
+  let scoreError = $state('')
 
-  let midiPlayer: MidiMixerPlayer | null = null
-  let stemPlayer: StemMixerPlayer | null = null
-  let mixerTracks: (MixerTrack | StemTrack)[] = []
-  let playerMode: 'stems' | 'midi' | null = null
-  let midiLoading = false
-  let midiPlayerError = ''
-  let playbackState: 'stopped' | 'playing' | 'paused' = 'stopped'
-  let playbackPosition = 0
-  let playbackDuration = 0
-  let playbackFrame: number | null = null
-  let globalVolume = 1.0
-  let trackLevels: Record<string, number> = {}
+  let midiPlayer = $state<MidiMixerPlayer | null>(null)
+  let stemPlayer = $state<StemMixerPlayer | null>(null)
+  let mixerTracks = $state<(MixerTrack | StemTrack)[]>([])
+  let playerMode = $state<'stems' | 'midi' | null>(null)
+  let midiLoading = $state(false)
+  let midiPlayerError = $state('')
+  let playbackState = $state<'stopped' | 'playing' | 'paused'>('stopped')
+  let playbackPosition = $state(0)
+  let playbackDuration = $state(0)
+  let pct = $derived(playbackDuration > 0 ? (playbackPosition / playbackDuration) * 100 : 0)
+  let playbackFrame = $state<number | null>(null)
+  let globalVolume = $state(1.0)
+  let trackLevels = $state<Record<string, number>>({})
 
   onMount(async () => {
     if (isPublicRoute && publicAccessKey) {
@@ -377,9 +379,7 @@
     }
   }
 
-  function updateTrackVolume(trackId: string, event: Event) {
-    const target = event.currentTarget as HTMLInputElement
-    const volume = Number(target.value) / 100
+  function updateTrackVolume(trackId: string, volume: number) {
     mixerTracks = mixerTracks.map((track) => (track.id === trackId ? { ...track, volume } : track))
     if (stemPlayer && playerMode === 'stems') {
       stemPlayer.setTrackVolume(trackId, volume)
@@ -388,9 +388,8 @@
     }
   }
 
-  function updateGlobalVolume(event: Event) {
-    const target = event.currentTarget as HTMLInputElement
-    globalVolume = Number(target.value) / 100
+  function updateGlobalVolume(volume: number) {
+    globalVolume = volume
     // Move every individual track slider to the new value
     mixerTracks = mixerTracks.map((track) => ({ ...track, volume: globalVolume }))
     if (stemPlayer && playerMode === 'stems') {
@@ -465,6 +464,17 @@
     trackLevels = {}
   }
 
+  function handleAdminPasswordKeydown(event: KeyboardEvent) {
+    if (event.key === 'Enter') {
+      void handleLogin()
+    }
+  }
+
+  function handleFileSelection(event: Event) {
+    const target = event.currentTarget as HTMLInputElement
+    selectedFile = target.files?.[0] ?? null
+  }
+
   function prettyDate(value: string) {
     return new Intl.DateTimeFormat(undefined, {
       dateStyle: 'medium',
@@ -497,25 +507,38 @@
 
 {#if isPublicRoute}
   <main class="page public-shell">
-    <section class="hero-panel">
-      <p class="eyebrow">Fumen</p>
-      <h1>Listen to a shared score</h1>
-      <p class="lede">
-        This page plays high-quality per-instrument audio stems rendered by the backend with
-        VSCO-2 Community Edition soundfonts. Each instrument gets its own volume control.
-      </p>
-    </section>
-
     <section class="content-panel">
       {#if publicLoading}
         <p class="status">Loading score...</p>
       {:else if publicError}
         <p class="status error">{publicError}</p>
       {:else if publicMusic}
-        <div class="music-card public-card">
-          <div>
-            <p class="meta-label">Title</p>
+        <div class="public-card">
+          <div class="public-score-pane">
+          <div class="score-scroll-area">
+          <div class="score-title-row">
             <h2>{publicMusic.title}</h2>
+            <div class="download-menu" class:open={downloadMenuOpen}>
+              <button class="download-menu-btn" onclick={() => (downloadMenuOpen = !downloadMenuOpen)} aria-haspopup="true" aria-expanded={downloadMenuOpen}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 3v12M7 11l5 5 5-5"/>
+                  <path d="M4 20h16"/>
+                </svg>
+                Download
+                <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+              </button>
+              {#if downloadMenuOpen}
+                <div class="download-dropdown">
+                  {#if publicMusic.midi_download_url}
+                    <a class="download-item" href={publicMusic.midi_download_url} download onclick={() => (downloadMenuOpen = false)}>Download MIDI</a>
+                  {/if}
+                  <a class="download-item" href={publicMusic.download_url} download onclick={() => (downloadMenuOpen = false)}>Download MuseScore</a>
+                  {#if publicMusic.audio_stream_url}
+                    <a class="download-item" href={publicMusic.audio_stream_url} download onclick={() => (downloadMenuOpen = false)}>Download Audio</a>
+                  {/if}
+                </div>
+              {/if}
+            </div>
           </div>
           <div class="meta-grid">
             <div>
@@ -525,10 +548,6 @@
             <div>
               <p class="meta-label">Uploaded</p>
               <p>{prettyDate(publicMusic.created_at)}</p>
-            </div>
-            <div>
-              <p class="meta-label">Stems</p>
-              <p class="status-pill">{publicMusic.stems_status}</p>
             </div>
             <div>
               <p class="meta-label">Instruments</p>
@@ -545,99 +564,69 @@
           {:else if scoreError}
             <p class="status error">Score: {scoreError}</p>
           {/if}
+          </div>
 
-          {#if midiLoading}
-            <p class="status">Preparing playback...</p>
-          {:else if mixerTracks.length > 0}
-            <div class="mixer-panel">
-              <div class="transport-bar">
-                <div class="transport-buttons">
-                  <button class="button" on:click={togglePlayback}>
-                    {playbackState === 'playing' ? 'Pause' : playbackPosition > 0 ? 'Resume' : 'Play'}
-                  </button>
-                  <button class="button ghost" on:click={stopPlayback}>Stop</button>
-                </div>
-
-                <div class="timeline-panel">
-                  <input
-                    class="timeline-slider"
-                    type="range"
-                    min="0"
-                    max={playbackDuration || 0}
-                    step="0.01"
-                    value={playbackPosition}
-                    on:input={handleSeek}
-                  />
-                  <p class="subtle">
-                    {formatTime(playbackPosition)} / {formatTime(playbackDuration)}
-                  </p>
-                </div>
-              </div>
-
-              <div class="mixer-board">
-                <div class="channel-strip global-strip">
-                  <span class="channel-level">{Math.round(globalVolume * 100)}%</span>
-                  <div class="channel-fader">
-                    <input
-                      type="range"
-                      min="0"
-                      max="200"
-                      value={Math.round(globalVolume * 100)}
-                      on:input={updateGlobalVolume}
-                    />
-                  </div>
-                  <p class="channel-name">All</p>
-                </div>
-
-                <div class="channel-divider"></div>
-
-                {#each mixerTracks as track}
-                  <div class="channel-strip" class:muted={track.muted}>
-                    <span class="channel-level">{percentVolume(track.volume)}%</span>
-                    <div class="channel-fader">
-                      <div class="channel-gauge">
-                        <div
-                          class="channel-gauge-fill"
-                          style="height: {Math.round((trackLevels[track.id] ?? 0) * 100)}%; --l: {Math.round((trackLevels[track.id] ?? 0) * 100)}%"
-                        ></div>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="200"
-                        value={percentVolume(track.volume)}
-                        on:input={(event) => updateTrackVolume(track.id, event)}
-                      />
-                    </div>
-                    <button class="mute-btn" class:active={track.muted} on:click={() => toggleTrackMute(track.id)}>M</button>
-                    <p class="channel-name">{track.name}</p>
-                  </div>
-                {/each}
-              </div>
-            </div>
-          {:else if mixerRequested}
-            <p class="hint">
-              Stem playback is not available yet.
-              {#if publicMusic.stems_error}
-                <br />
-                <span>Stems: {publicMusic.stems_error}</span>
+          <div class="playbar" class:is-playing={playbackState === 'playing'}>
+            <button
+              class="playbar-btn playbar-play"
+              onclick={togglePlayback}
+              disabled={mixerTracks.length === 0}
+              aria-label={playbackState === 'playing' ? 'Pause' : 'Play'}
+            >
+              {#if playbackState === 'playing'}
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="4" width="4" height="16" rx="1.5"/>
+                  <rect x="15" y="4" width="4" height="16" rx="1.5"/>
+                </svg>
+              {:else}
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M7 4.5 L7 19.5 L20 12 Z"/>
+                </svg>
               {/if}
-            </p>
-          {:else}
-            <p class="hint">
-              Preparing stem playback.
-            </p>
-          {/if}
+            </button>
+            <button
+              class="playbar-btn playbar-stop"
+              onclick={stopPlayback}
+              disabled={mixerTracks.length === 0}
+              aria-label="Stop"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="4" y="4" width="16" height="16" rx="2"/>
+              </svg>
+            </button>
+            <div class="playbar-progress">
+              <input
+                class="playbar-track"
+                type="range"
+                min="0"
+                max={playbackDuration || 0}
+                step="0.01"
+                value={playbackPosition}
+                oninput={handleSeek}
+                disabled={mixerTracks.length === 0}
+                style="--pct: {pct}%"
+                aria-label="Playback position"
+              />
+            </div>
+            <span class="playbar-time">
+              {formatTime(playbackPosition)}<span class="playbar-sep"> / </span>{formatTime(playbackDuration)}
+            </span>
+          </div>
+          </div>
 
-          {#if midiPlayerError}
-            <p class="status error">{midiPlayerError}</p>
-          {/if}
-
-          <div class="actions">
-            <a class="button secondary" href={publicMusic.download_url}>Download .mscz</a>
-            {#if publicMusic.midi_download_url}
-              <a class="button secondary" href={publicMusic.midi_download_url}>Download MIDI</a>
-            {/if}
+          <div class="public-mixer-pane">
+            <Mixer
+              {midiLoading}
+              {mixerTracks}
+              {mixerRequested}
+              {globalVolume}
+              {trackLevels}
+              {midiPlayerError}
+              stemsError={publicMusic.stems_error}
+              onGlobalVolumeChange={updateGlobalVolume}
+              onTrackVolumeChange={updateTrackVolume}
+              onTrackMuteToggle={toggleTrackMute}
+            />
           </div>
         </div>
       {/if}
@@ -646,11 +635,10 @@
 {:else}
   <main class="page admin-shell">
     <section class="hero-panel">
-      <p class="eyebrow">Fumen</p>
-      <h1>Private upload desk</h1>
+      <p class="eyebrow">Fumen — Admin</p>
+      <h1>Private upload<br />desk</h1>
       <p class="lede">
-        Upload `.mscz` scores, store them in the configured backend, and hand out either a random
-        share link or a friendly public id.
+        Upload .mscz scores, render instrument stems, and share with a friendly public link.
       </p>
     </section>
 
@@ -663,10 +651,10 @@
               bind:value={adminPassword}
               type="password"
               placeholder="Hard-coded backend password"
-              on:keydown={(event) => event.key === 'Enter' && handleLogin()}
+              onkeydown={handleAdminPasswordKeydown}
             />
           </label>
-          <button class="button" disabled={adminLoading} on:click={handleLogin}>
+          <button class="button" disabled={adminLoading} onclick={handleLogin}>
             {adminLoading ? 'Checking...' : 'Open admin'}
           </button>
           {#if adminError}
@@ -674,12 +662,14 @@
           {/if}
         </div>
       {:else}
+        <div class="admin-layout">
+        <div class="admin-sidebar">
         <div class="toolbar">
           <div>
             <p class="meta-label">Session</p>
             <p class="toolbar-title">Authenticated with the hard-coded admin password</p>
           </div>
-          <button class="button ghost" on:click={logout}>Log out</button>
+          <button class="button ghost" onclick={logout}>Log out</button>
         </div>
 
         <div class="music-card upload-card">
@@ -716,15 +706,12 @@
                 id="mscz-input"
                 type="file"
                 accept=".mscz"
-                on:change={(event) => {
-                  const target = event.currentTarget as HTMLInputElement
-                  selectedFile = target.files?.[0] ?? null
-                }}
+                onchange={handleFileSelection}
               />
             </label>
           </div>
 
-          <button class="button" disabled={uploadBusy} on:click={handleUpload}>
+          <button class="button" disabled={uploadBusy} onclick={handleUpload}>
             {uploadBusy ? 'Uploading...' : 'Upload score'}
           </button>
         </div>
@@ -737,6 +724,8 @@
           <p class="status success">{adminSuccess}</p>
         {/if}
 
+        </div>
+        <div class="admin-main">
         <section class="list-section">
           <div class="card-header">
             <div>
@@ -804,18 +793,18 @@
                     <button
                       class="button secondary"
                       disabled={savingIdFor === music.id}
-                      on:click={() => handleSavePublicId(music.id)}
+                      onclick={() => handleSavePublicId(music.id)}
                     >
                       {savingIdFor === music.id ? 'Saving...' : 'Save id'}
                     </button>
                   </div>
 
                   <div class="actions">
-                    <button class="button ghost" on:click={() => copyLink(music.public_url)}>
+                    <button class="button ghost" onclick={() => copyLink(music.public_url)}>
                       Copy random link
                     </button>
                     {#if music.public_id_url}
-                      <button class="button ghost" on:click={() => copyLink(music.public_id_url!)}>
+                      <button class="button ghost" onclick={() => copyLink(music.public_id_url!)}>
                         Copy id link
                       </button>
                     {/if}
@@ -823,7 +812,7 @@
                       <button
                         class="button secondary"
                         disabled={retryingFor === music.id}
-                        on:click={() => handleRetryRender(music.id)}
+                        onclick={() => handleRetryRender(music.id)}
                       >
                         {retryingFor === music.id ? 'Retrying...' : 'Retry render'}
                       </button>
@@ -847,6 +836,8 @@
             </div>
           {/if}
         </section>
+        </div>
+        </div>
       {/if}
     </section>
   </main>

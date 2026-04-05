@@ -14,15 +14,17 @@ use axum::{
 };
 use bytes::Bytes;
 use config::{AppConfig, StorageConfig};
+use flate2::{Compression, write::GzEncoder};
 use models::{
-    AdminMusicResponse, LoginRequest, LoginResponse, MusicRecord, PublicMusicResponse, StemInfo,
-    StemRecord, UpdateMusicRequest,
+    AdminMusicResponse, ExportMixerGainsRequest, LoginRequest, LoginResponse, MusicRecord,
+    PublicMusicResponse, StemInfo, StemRecord, UpdateMusicRequest,
 };
 use rand::{Rng, distr::Alphanumeric};
 use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use std::io::Write;
 use std::str::FromStr;
 use std::{net::SocketAddr, path::PathBuf};
 use storage::Storage;
@@ -30,6 +32,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Command;
 use tower_http::{
+    compression::CompressionLayer,
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
 };
@@ -148,6 +151,11 @@ async fn main() -> Result<()> {
             get(admin_list_musics).post(admin_upload_music),
         )
         .route("/admin/musics/{id}", patch(admin_update_music))
+        .route("/admin/musics/{id}/gains", get(admin_export_score_gains))
+        .route(
+            "/admin/public/{access_key}/gains",
+            get(admin_export_public_score_gains).post(admin_export_public_mixer_gains),
+        )
         .route("/admin/musics/{id}/retry", post(admin_retry_render))
         .route("/public/{access_key}", get(public_music))
         .route("/public/{access_key}/audio", get(public_music_audio))
@@ -164,6 +172,7 @@ async fn main() -> Result<()> {
     let mut app = Router::new()
         .nest("/api", api_routes)
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
+        .layer(CompressionLayer::new())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -621,7 +630,7 @@ async fn admin_retry_render(
         audio::StemQualityProfile::from_stored_or_default(&record.quality_profile);
 
     // Fetch the original score bytes from storage.
-    let (score_bytes, _) = state.storage.get_bytes(&record.object_key).await?;
+    let (score_bytes, _, _) = state.storage.get_bytes(&record.object_key).await?;
 
     let safe_filename = sanitize_filename(&record.filename);
     let temp_dir = tempfile::tempdir()?;
@@ -780,7 +789,7 @@ async fn public_music_stems(
             if let Some(path) = state.storage.local_path_for_key(&stem.storage_key) {
                 probe_audio_duration_seconds(&path).await?
             } else {
-                let (stem_bytes, _) = state.storage.get_bytes(&stem.storage_key).await?;
+                let (stem_bytes, _, _) = state.storage.get_bytes(&stem.storage_key).await?;
                 let temp_dir = tempfile::tempdir()?;
                 let full_stem_path = temp_dir.path().join("stem.ogg");
                 fs::write(&full_stem_path, stem_bytes).await?;
@@ -828,10 +837,12 @@ async fn public_music_stem_audio(
         .await;
     }
 
-    let (bytes, content_type) = state.storage.get_bytes(&stem.storage_key).await?;
+    let (bytes, content_type, content_encoding) =
+        state.storage.get_bytes(&stem.storage_key).await?;
     Ok(binary_response(
         bytes,
         content_type.unwrap_or_else(|| "audio/ogg".to_owned()),
+        content_encoding,
         Some(format!("inline; filename=\"{}.ogg\"", stem.track_name)),
     ))
 }
@@ -849,9 +860,19 @@ async fn store_conversion(
             extension,
         } => {
             let object_key = format!("{kind}/{music_id}.{extension}");
+            let (stored_bytes, content_encoding) = if kind == "musicxml" && state.storage.is_s3() {
+                (gzip_bytes(&bytes)?, Some("gzip"))
+            } else {
+                (bytes, None)
+            };
             state
                 .storage
-                .upload_bytes(&object_key, bytes, content_type)
+                .upload_bytes_with_encoding(
+                    &object_key,
+                    stored_bytes,
+                    content_type,
+                    content_encoding,
+                )
                 .await?;
             Ok((Some(object_key), "ready".to_owned(), None))
         }
@@ -899,6 +920,104 @@ async fn admin_update_music(
     )))
 }
 
+async fn admin_export_score_gains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    require_admin(&headers, &state.config)?;
+
+    let record = find_music_by_id(&state.db_rw, &id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Music not found"))?;
+
+    export_score_gains_response(&state, &record).await
+}
+
+async fn admin_export_public_score_gains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(access_key): Path<String>,
+) -> Result<Response, AppError> {
+    require_admin(&headers, &state.config)?;
+
+    let record = find_public_music_record(&state, &access_key)
+        .await?
+        .ok_or_else(|| AppError::not_found("Music not found"))?;
+
+    export_score_gains_response(&state, &record).await
+}
+
+async fn admin_export_public_mixer_gains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(access_key): Path<String>,
+    Json(payload): Json<ExportMixerGainsRequest>,
+) -> Result<Response, AppError> {
+    require_admin(&headers, &state.config)?;
+
+    let record = find_public_music_record(&state, &access_key)
+        .await?
+        .ok_or_else(|| AppError::not_found("Music not found"))?;
+    let midi_key = record
+        .midi_object_key
+        .clone()
+        .ok_or_else(|| AppError::not_found("MIDI export is not available for this score"))?;
+    let (midi_bytes, _, _) = state.storage.get_bytes(&midi_key).await?;
+    let track_settings = payload
+        .tracks
+        .into_iter()
+        .map(|track| audio::LiveMixerTrackSetting {
+            track_index: track.track_index,
+            volume_multiplier: track.volume_multiplier,
+            muted: track.muted,
+        })
+        .collect::<Vec<_>>();
+    let gains =
+        audio::export_live_mixer_gain_template(&state.config, &midi_bytes, &track_settings).await?;
+
+    Ok(binary_response(
+        Bytes::from(
+            serde_json::to_vec_pretty(&gains)
+                .map_err(|error| AppError::from(anyhow::Error::from(error)))?,
+        ),
+        "application/json".to_owned(),
+        None,
+        Some(format!(
+            "attachment; filename=\"{}\"",
+            gains_filename_for(&record.filename)
+        )),
+    ))
+}
+
+async fn export_score_gains_response(
+    state: &AppState,
+    record: &MusicRecord,
+) -> Result<Response, AppError> {
+    let gains = if let Some(path) = state.storage.local_path_for_key(&record.object_key) {
+        audio::export_score_gain_template(&state.config, &path).await?
+    } else {
+        let (bytes, _, _) = state.storage.get_bytes(&record.object_key).await?;
+        let temp_dir = tempfile::tempdir()?;
+        let temp_score_path = temp_dir.path().join(sanitize_filename(&record.filename));
+        fs::write(&temp_score_path, bytes).await?;
+        audio::export_score_gain_template(&state.config, &temp_score_path).await?
+    };
+
+    let body = serde_json::to_vec_pretty(&gains)
+        .map_err(|error| AppError::from(anyhow::Error::from(error)))?;
+
+    Ok(binary_response(
+        Bytes::from(body),
+        "application/json".to_owned(),
+        None,
+        Some(format!(
+            "attachment; filename=\"{}\"",
+            gains_filename_for(&record.filename)
+        )),
+    ))
+}
+
 async fn public_music(
     State(state): State<AppState>,
     Path(access_key): Path<String>,
@@ -926,10 +1045,11 @@ async fn public_music_audio(
         .audio_object_key
         .ok_or_else(|| AppError::not_found("Audio preview is not available for this score"))?;
 
-    let (bytes, content_type) = state.storage.get_bytes(&audio_key).await?;
+    let (bytes, content_type, content_encoding) = state.storage.get_bytes(&audio_key).await?;
     Ok(binary_response(
         bytes,
         content_type.unwrap_or_else(|| "audio/mpeg".to_owned()),
+        content_encoding,
         Some("inline; filename=\"preview.mp3\"".to_owned()),
     ))
 }
@@ -946,10 +1066,11 @@ async fn public_music_midi(
         .midi_object_key
         .ok_or_else(|| AppError::not_found("MIDI export is not available for this score"))?;
 
-    let (bytes, content_type) = state.storage.get_bytes(&midi_key).await?;
+    let (bytes, content_type, content_encoding) = state.storage.get_bytes(&midi_key).await?;
     Ok(binary_response(
         bytes,
         content_type.unwrap_or_else(|| "audio/midi".to_owned()),
+        content_encoding,
         Some(format!(
             "attachment; filename=\"{}\"",
             midi_filename_for(&record.filename)
@@ -969,10 +1090,11 @@ async fn public_music_musicxml(
         .musicxml_object_key
         .ok_or_else(|| AppError::not_found("MusicXML export is not available for this score"))?;
 
-    let (bytes, content_type) = state.storage.get_bytes(&musicxml_key).await?;
+    let (bytes, content_type, content_encoding) = state.storage.get_bytes(&musicxml_key).await?;
     Ok(binary_response(
         bytes,
         content_type.unwrap_or_else(|| "application/xml".to_owned()),
+        content_encoding,
         // inline so the browser/OSMD can fetch it; filename still set for right-click-save
         Some(format!(
             "inline; filename=\"{}.musicxml\"",
@@ -989,10 +1111,12 @@ async fn public_music_download(
         .await?
         .ok_or_else(|| AppError::not_found("Music not found"))?;
 
-    let (bytes, content_type) = state.storage.get_bytes(&record.object_key).await?;
+    let (bytes, content_type, content_encoding) =
+        state.storage.get_bytes(&record.object_key).await?;
     Ok(binary_response(
         bytes,
         content_type.unwrap_or(record.content_type),
+        content_encoding,
         Some(format!(
             "attachment; filename=\"{}\"",
             sanitize_content_disposition(&record.filename)
@@ -1226,6 +1350,15 @@ fn midi_filename_for(filename: &str) -> String {
     sanitize_content_disposition(&format!("{stem}.mid"))
 }
 
+fn gains_filename_for(filename: &str) -> String {
+    let stem = filename
+        .trim_end_matches(".mscz")
+        .trim_end_matches(".MSCZ")
+        .trim_end_matches(".mscx")
+        .trim_end_matches(".MSCX");
+    sanitize_content_disposition(&format!("{stem}.gains.json"))
+}
+
 fn stem_full_key(music_id: &str, track_index: usize) -> String {
     format!("stems/{music_id}/{track_index}.ogg")
 }
@@ -1233,6 +1366,7 @@ fn stem_full_key(music_id: &str, track_index: usize) -> String {
 fn binary_response(
     bytes: Bytes,
     content_type: String,
+    content_encoding: Option<String>,
     content_disposition: Option<String>,
 ) -> Response {
     let mut response = Response::new(axum::body::Body::from(bytes));
@@ -1250,7 +1384,22 @@ fn binary_response(
         }
     }
 
+    if let Some(content_encoding) = content_encoding {
+        if let Ok(value) = HeaderValue::from_str(&content_encoding) {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, value);
+        }
+    }
+
     response
+}
+
+fn gzip_bytes(bytes: &Bytes) -> Result<Bytes, AppError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).map_err(AppError::from)?;
+    let compressed = encoder.finish().map_err(AppError::from)?;
+    Ok(Bytes::from(compressed))
 }
 
 async fn local_file_response(
@@ -1294,6 +1443,7 @@ async fn local_file_response(
     let mut response = binary_response(
         Bytes::from(bytes),
         content_type.to_owned(),
+        None,
         content_disposition,
     );
     *response.status_mut() = status;

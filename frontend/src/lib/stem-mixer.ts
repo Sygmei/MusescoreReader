@@ -179,7 +179,7 @@ export class StemMixerPlayer {
   setTrackVolume(trackId: string, volume: number): void {
     const track = this.tracks.get(trackId)
     if (!track) return
-    track.volume = Math.max(0, Math.min(volume, 1))
+    track.volume = Math.max(0, Math.min(volume, 2))
     this._applyTrackGain(track)
   }
 

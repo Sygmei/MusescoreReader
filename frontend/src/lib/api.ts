@@ -116,6 +116,40 @@ async function requestJson<T>(path: string, options: JsonOptions = {}): Promise<
   return (await response.json()) as T
 }
 
+async function requestBlob(path: string, options: JsonOptions = {}): Promise<Blob> {
+  const headers = new Headers(options.headers)
+
+  if (options.password) {
+    headers.set('x-admin-password', options.password)
+  }
+
+  if (!(options.body instanceof FormData) && options.body && !headers.has('content-type')) {
+    headers.set('content-type', 'application/json')
+  }
+
+  const response = await fetch(path, {
+    ...options,
+    headers,
+  })
+
+  if (!response.ok) {
+    let message = `Request failed with status ${response.status}`
+
+    try {
+      const payload = (await response.json()) as { error?: string }
+      if (payload.error) {
+        message = payload.error
+      }
+    } catch {
+      // Ignore JSON parsing errors and keep the fallback message.
+    }
+
+    throw new Error(message)
+  }
+
+  return response.blob()
+}
+
 export async function login(password: string): Promise<void> {
   await requestJson('/api/admin/login', {
     method: 'POST',
@@ -150,6 +184,30 @@ export async function retryRender(password: string, id: string): Promise<AdminMu
   return requestJson<AdminMusic>(`/api/admin/musics/${id}/retry`, {
     method: 'POST',
     password,
+  })
+}
+
+export async function downloadScoreGains(password: string, id: string): Promise<Blob> {
+  return requestBlob(`/api/admin/musics/${id}/gains`, {
+    password,
+  })
+}
+
+export async function downloadPublicScoreGains(password: string, accessKey: string): Promise<Blob> {
+  return requestBlob(`/api/admin/public/${encodeURIComponent(accessKey)}/gains`, {
+    password,
+  })
+}
+
+export async function exportPublicMixerGains(
+  password: string,
+  accessKey: string,
+  tracks: Array<{ track_index: number; volume_multiplier: number; muted: boolean }>,
+): Promise<Blob> {
+  return requestBlob(`/api/admin/public/${encodeURIComponent(accessKey)}/gains`, {
+    method: 'POST',
+    password,
+    body: JSON.stringify({ tracks }),
   })
 }
 

@@ -62,6 +62,19 @@ pub struct UpdateMusicRequest {
     pub public_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ExportMixerGainsRequest {
+    pub tracks: Vec<ExportMixerTrackRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExportMixerTrackRequest {
+    pub track_index: usize,
+    pub volume_multiplier: f64,
+    #[serde(default)]
+    pub muted: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StemInfo {
     pub track_index: i64,
